@@ -261,15 +261,9 @@ class StreamExecutor:
         ret = self.meta_info.get(name, None)
         return ret
 
-    def fork(
-        self,
-        number: int,
-        position_ids_offset: Optional[List[int]] = None,
-        copy: bool = False,
-    ):
-        if number > 1 or copy:
-            self.submit(SglCommitLazy())
-            self.sync()
+    def fork(self, number: int, position_ids_offset: Optional[List[int]] = None):
+        self.submit(SglCommitLazy())
+        self.sync()
 
         number = int(number)
 
@@ -652,20 +646,15 @@ class ProgramState:
         yield
         self.stream_executor.submit(SglVarScopeEnd(name))
 
-    def fork(
-        self,
-        number: int = 1,
-        position_ids_offset: Optional[List[int]] = None,
-        copy: bool = False,
-    ):
-        stream_executors = self.stream_executor.fork(number, position_ids_offset, copy)
+    def fork(self, number: int = 1, position_ids_offset: Optional[List[int]] = None):
+        stream_executors = self.stream_executor.fork(number, position_ids_offset)
         states = [ProgramState(x) for x in stream_executors]
         state_group = ProgramStateGroup(states, self)
         return state_group
 
     @contextmanager
     def copy(self, position_ids_offset: Optional[List[int]] = None):
-        state_group = self.fork(1, position_ids_offset, True)
+        state_group = self.fork(1, position_ids_offset)
         try:
             yield state_group[0]
         finally:
