@@ -30,10 +30,8 @@ class RuntimeEndpoint(BaseBackend):
         self.support_concate_and_append = True
 
         if isinstance(base_url, str):
-            self.base_url = base_url
             self.base_urls = [base_url]
         else:
-            self.base_url = base_url[0]
             self.base_urls = base_url
 
         self.api_key = api_key
@@ -59,6 +57,10 @@ class RuntimeEndpoint(BaseBackend):
             return random.choice(self.base_urls)
         else:
             return self.base_urls[s.parent_sid % len(self.base_urls)]
+    
+    @property
+    def base_url(self):
+        return self.get_base_url()
     
     def get_model_name(self):
         return self.model_info["model_path"]

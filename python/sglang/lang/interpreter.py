@@ -283,7 +283,7 @@ class StreamExecutor:
                 self.default_sampling_para,
                 self.chat_template,
                 self.stream,
-                self.parent_sid,
+                parent_sid=self.parent_sid,
             )
             for _ in range(size)
         ]
