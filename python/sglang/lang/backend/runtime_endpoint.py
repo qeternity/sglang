@@ -52,8 +52,11 @@ class RuntimeEndpoint(BaseBackend):
                 self.model_info["model_path"]
             )
     
-    def get_base_url(self):
-        return random.choice(self.base_urls)
+    def get_base_url(self, s: Optional[StreamExecutor] = None):
+        if s is None:
+            return random.choice(self.base_urls)
+        else:
+            return self.base_urls[s.parent_sid % len(self.base_urls)]
     
     @property
     def base_url(self):
@@ -95,7 +98,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate",
+            self.get_base_url(s) + "/generate",
             json=data,
             api_key=self.api_key,
             verify=self.verify,
@@ -106,7 +109,7 @@ class RuntimeEndpoint(BaseBackend):
         data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
         self._add_images(s, data)
         res = http_request(
-            self.base_url + "/generate",
+            self.get_base_url(s) + "/generate",
             json=data,
             api_key=self.api_key,
             verify=self.verify,
@@ -173,7 +176,7 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         res = http_request(
-            self.base_url + "/generate",
+            self.get_base_url(s) + "/generate",
             json=data,
             api_key=self.api_key,
             verify=self.verify,
@@ -214,7 +217,7 @@ class RuntimeEndpoint(BaseBackend):
         self._add_images(s, data)
 
         res = http_request(
-            self.base_url + "/generate",
+            self.get_base_url(s) + "/generate",
             json=data,
             stream=True,
             api_key=self.api_key,
