@@ -1,4 +1,5 @@
 import json
+import random
 import warnings
 from typing import List, Optional
 
@@ -20,7 +21,7 @@ from sglang.utils import http_request
 class RuntimeEndpoint(BaseBackend):
     def __init__(
         self,
-        base_url: str,
+        base_url: str | List[str],
         api_key: Optional[str] = None,
         verify: Optional[str] = None,
         chat_template_name: Optional[str] = None,
@@ -28,7 +29,11 @@ class RuntimeEndpoint(BaseBackend):
         super().__init__()
         self.support_concate_and_append = True
 
-        self.base_url = base_url
+        if isinstance(base_url, str):
+            self.base_urls = [base_url]
+        else:
+            self.base_urls = base_url
+
         self.api_key = api_key
         self.verify = verify
 
@@ -46,6 +51,13 @@ class RuntimeEndpoint(BaseBackend):
             self.chat_template = get_chat_template_by_model_path(
                 self.model_info["model_path"]
             )
+    
+    def get_base_url(self):
+        return random.choice(self.base_urls)
+    
+    @property
+    def base_url(self):
+        return self.get_base_url()
 
     def get_model_name(self):
         return self.model_info["model_path"]
