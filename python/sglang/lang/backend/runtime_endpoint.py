@@ -56,7 +56,7 @@ class RuntimeEndpoint(BaseBackend):
         if s is None:
             return random.choice(self.base_urls)
         else:
-            return self.base_urls[s.parent_sid % len(self.base_urls)]
+            return self.base_urls[int(s.parent_sid, 16) % len(self.base_urls)]
     
     @property
     def base_url(self):
