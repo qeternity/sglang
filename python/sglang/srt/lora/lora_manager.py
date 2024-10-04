@@ -18,15 +18,17 @@ limitations under the License.
 
 
 import re
-from dataclasses import dataclass
 
 import torch
-from flashinfer import SegmentGEMMWrapper
 
 from sglang.srt.lora.lora import LoRAAdapter, get_lora_layer
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import replace_submodule
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import is_hip, replace_submodule
+
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer import SegmentGEMMWrapper
 
 
 def get_stacked_name(name):
@@ -96,10 +98,10 @@ class LoRAManager:
         # get configs and target modules
         self.configs = {}
         self.origin_target_modules = set()
-        for path in self.lora_paths:
-            self.configs[path] = LoRAConfig(path)
+        for name, path in self.lora_paths.items():
+            self.configs[name] = LoRAConfig(path)
             self.origin_target_modules = set(self.origin_target_modules) | set(
-                self.configs[path].target_modules
+                self.configs[name].target_modules
             )
         self.target_modules = set(
             [
@@ -114,11 +116,11 @@ class LoRAManager:
         # load all weights to cpu
         self.loras = []
         self.lora_id = {}
-        for path in self.lora_paths:
-            self.lora_id[path] = len(self.loras)
+        for name in self.lora_paths.keys():
+            self.lora_id[name] = len(self.loras)
             self.loras.append(
                 LoRAAdapter(
-                    path, self.configs[path], self.base_hf_config, self.load_config
+                    name, self.configs[name], self.base_hf_config, self.load_config
                 )
             )
             self.loras[-1].initialize_weights()
@@ -205,9 +207,9 @@ class LoRAManager:
                     if lora_weight_name:
                         self.B_buffer[lora_weight_name][i][buffer_id].copy_(weights)
 
-    def prepare_lora_batch(self, batch, extend_seq_lens=None):
+    def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # load active loras into lora memory pool
-        cur_uids = set([req.lora_path for req in batch.reqs])
+        cur_uids = set(forward_batch.lora_paths)
         assert len(cur_uids) <= self.max_loras_per_batch
         i = 0
         evictable_uids = list(self.active_uids)
@@ -227,11 +229,15 @@ class LoRAManager:
             return
 
         # setup lora in forward modules
-        bs = len(batch.reqs)
-        seg_lens = extend_seq_lens if batch.forward_mode.is_extend() else torch.ones(bs)
+        bs = forward_batch.batch_size
+        seg_lens = (
+            forward_batch.extend_seq_lens
+            if forward_batch.forward_mode.is_extend()
+            else torch.ones(bs)
+        )
         weight_indices = torch.empty((bs,), dtype=torch.int64, device="cuda")
-        for i, req in enumerate(batch.reqs):
-            weight_indices[i] = self.buffer_id[req.lora_path]
+        for i, lora_path in enumerate(forward_batch.lora_paths):
+            weight_indices[i] = self.buffer_id[lora_path]
 
         for module_name, module in self.lora_modules:
             layer_id = get_layer_id(module_name)

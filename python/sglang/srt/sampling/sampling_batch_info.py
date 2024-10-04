@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 import torch
 
 import sglang.srt.sampling.penaltylib as penaltylib
+from sglang.srt.constrained import RegexGuide
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -22,88 +23,43 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor = None
     min_ps: torch.Tensor = None
 
-    # Dispatch in CUDA graph
-    need_min_p_sampling: bool = False
-
     # Bias Tensors
     logit_bias: torch.Tensor = None
     vocab_mask: torch.Tensor = None
+
+    # FSM states
+    regex_fsms: List[RegexGuide] = None
+    regex_fsm_states: List[int] = None
+
+    # Dispatch in CUDA graph
+    need_min_p_sampling: bool = False
 
     # Penalizer
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator = None
     linear_penalties: torch.Tensor = None
     scaling_penalties: torch.Tensor = None
 
-    def __len__(self):
-        return len(self.temperatures)
-
-    def can_run_in_cuda_graph(self):
-        # Vocab bias and min_ps are not supported in CUDA graph
-        return (
-            self.logit_bias is None
-            and self.linear_penalties is None
-            and self.scaling_penalties is None
-            and not self.need_min_p_sampling
-        )
-
-    @classmethod
-    def dummy_one(cls, max_bs: int, vocab_size: int):
-        ret = cls(vocab_size=vocab_size)
-        with torch.device("cuda"):
-            ret.temperatures = torch.ones((max_bs, 1), dtype=torch.float)
-            ret.top_ps = torch.ones((max_bs,), dtype=torch.float)
-            ret.top_ks = torch.ones((max_bs,), dtype=torch.int)
-            ret.vocab_mask = torch.zeros((max_bs, vocab_size), dtype=torch.bool)
-        return ret
-
-    def __getitem__(self, key):
-        if isinstance(key, slice):
-            # NOTE:This method is only used in CUDA graph
-            assert self.can_run_in_cuda_graph()
-            return SamplingBatchInfo(
-                vocab_size=self.vocab_size,
-                temperatures=self.temperatures[key],
-                top_ps=self.top_ps[key],
-                top_ks=self.top_ks[key],
-                vocab_mask=self.vocab_mask[key],
-            )
-        else:
-            raise NotImplementedError
-
-    def inplace_assign(self, bs: int, other: SamplingBatchInfo):
-        # NOTE:This method is only used in CUDA graph
-        assert self.can_run_in_cuda_graph()
-
-        self.vocab_size = other.vocab_size
-        self.temperatures[:bs] = other.temperatures
-        self.top_ps[:bs] = other.top_ps
-        self.top_ks[:bs] = other.top_ks
-
-        if other.vocab_mask is None:
-            self.vocab_mask[:bs].fill_(False)
-        else:
-            self.vocab_mask[:bs] = other.vocab_mask
-
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        device = "cuda"
         reqs = batch.reqs
         ret = cls(vocab_size=vocab_size)
 
-        ret.temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        ret.top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
-        ret.top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int, device=device
-        )
-        ret.min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+        with torch.device("cuda"):
+            ret.temperatures = torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+            ).view(-1, 1)
+            ret.top_ps = torch.tensor(
+                [r.sampling_params.top_p for r in reqs], dtype=torch.float
+            )
+            ret.top_ks = torch.tensor(
+                [r.sampling_params.top_k for r in reqs], dtype=torch.int
+            )
+            ret.min_ps = torch.tensor(
+                [r.sampling_params.min_p for r in reqs], dtype=torch.float
+            )
+
+        # TODO (lianmin): `need_min_p_sampling` needs to be updated in filter and merge.
         ret.need_min_p_sampling = any(r.sampling_params.min_p > 0 for r in reqs)
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -116,7 +72,7 @@ class SamplingBatchInfo:
         ret.penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            device=device,
+            device="cuda",
             Penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
@@ -128,7 +84,14 @@ class SamplingBatchInfo:
         # Handle logit bias but only allocate when needed
         ret.logit_bias = None
 
+        # This is only for regex_fsm. We notice a regression if we maintain the list of regex_fsm
+        # in SamplingBatchInfo, so we keep it here.
+        ret.schedule_batch = batch
+
         return ret
+
+    def __len__(self):
+        return len(self.temperatures)
 
     def update_penalties(self):
         self.scaling_penalties = None
@@ -149,24 +112,24 @@ class SamplingBatchInfo:
                         )
                     self.linear_penalties = penalizer.apply(self.linear_penalties)
 
-    def update_regex_vocab_mask(self, batch: ScheduleBatch):
-        has_regex = any(req.regex_fsm is not None for req in batch.reqs)
+    def update_regex_vocab_mask(self):
+        has_regex = any(req.regex_fsm is not None for req in self.schedule_batch.reqs)
 
         # Reset the vocab mask
         self.vocab_mask = None
 
         if has_regex:
             self.vocab_mask = torch.zeros(
-                batch.batch_size(), self.vocab_size, dtype=torch.bool, device="cuda"
+                len(self.temperatures), self.vocab_size, dtype=torch.bool, device="cuda"
             )
-            for i, req in enumerate(batch.reqs):
+            for i, req in enumerate(self.schedule_batch.reqs):
                 if req.regex_fsm is not None:
                     self.vocab_mask[i].fill_(1)
                     self.vocab_mask[i][
                         req.regex_fsm.get_next_instruction(req.regex_fsm_state).tokens
                     ] = 0
 
-    def filter(self, unfinished_indices: List[int], new_indices: torch.Tensor):
+    def filter_batch(self, unfinished_indices: List[int], new_indices: torch.Tensor):
         self.penalizer_orchestrator.filter(unfinished_indices, new_indices)
 
         for item in [
@@ -176,9 +139,9 @@ class SamplingBatchInfo:
             "min_ps",
             "logit_bias",
         ]:
-            self_val = getattr(self, item, None)
-            if self_val is not None:  # logit_bias can be None
-                setattr(self, item, self_val[new_indices])
+            value = getattr(self, item, None)
+            if value is not None:  # logit_bias can be None
+                setattr(self, item, value[new_indices])
 
     @staticmethod
     def merge_bias_tensor(
@@ -200,7 +163,7 @@ class SamplingBatchInfo:
 
         return None
 
-    def merge(self, other: "SamplingBatchInfo"):
+    def merge_batch(self, other: "SamplingBatchInfo"):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         for item in [

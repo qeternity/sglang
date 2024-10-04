@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -472,7 +472,7 @@ def v1_generate_request(
     first_prompt_type = type(all_requests[0].prompt)
     for request in all_requests:
         assert (
-            type(request.prompt) == first_prompt_type
+            type(request.prompt) is first_prompt_type
         ), "All prompts must be of the same type in file input settings"
         if len(all_requests) > 1 and request.n > 1:
             raise ValueError(
@@ -858,11 +858,18 @@ def v1_chat_generate_request(
                                 openai_compatible_messages.append(
                                     {"role": message.role, "content": content["text"]}
                                 )
+                if openai_compatible_messages[-1]["role"] == "assistant":
+                    assistant_prefix = openai_compatible_messages[-1]["content"]
+                    openai_compatible_messages = openai_compatible_messages[:-1]
+                else:
+                    assistant_prefix = None
                 prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                 )
+                if assistant_prefix:
+                    prompt_ids += tokenizer_manager.tokenizer.encode(assistant_prefix)
                 stop = request.stop
                 image_data = None
                 modalities = []
@@ -887,7 +894,7 @@ def v1_chat_generate_request(
         input_ids.append(prompt_ids)
         return_logprobs.append(request.logprobs)
         logprob_start_lens.append(-1)
-        top_logprobs_nums.append(request.top_logprobs)
+        top_logprobs_nums.append(request.top_logprobs or 0)
 
         sampling_params = {
             "temperature": request.temperature,

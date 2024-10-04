@@ -1,5 +1,7 @@
 """
-Benchmark the latency of a given model. It accepts arguments similar to those of launch_server.py.
+Benchmark the latency of running a single static batch.
+This script does not launch a server and uses the low-level APIs.
+It accepts arguments similar to those of launch_server.py.
 
 # Usage (latency test)
 ## with dummy weights:
@@ -60,10 +62,17 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server import _set_envs_and_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import suppress_other_loggers
+from sglang.srt.utils import (
+    allocate_init_ports,
+    configure_logger,
+    kill_child_process,
+    suppress_other_loggers,
+)
 
 
 @dataclasses.dataclass
@@ -118,6 +127,11 @@ def load_model(server_args, tp_rank):
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
+    server_args.port, server_args.additional_ports = allocate_init_ports(
+        server_args.port,
+        server_args.additional_ports,
+        server_args.dp_size,
+    )
     model_config = ModelConfig(
         server_args.model_path,
         server_args.trust_remote_code,
@@ -129,7 +143,7 @@ def load_model(server_args, tp_rank):
         gpu_id=tp_rank,
         tp_rank=tp_rank,
         tp_size=server_args.tp_size,
-        nccl_port=28888,
+        nccl_port=server_args.additional_ports[-1],
         server_args=server_args,
     )
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
@@ -160,10 +174,15 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
         assert len(input_ids[i]) > bench_args.cut_len
 
         tmp_input_ids = input_ids[i][: bench_args.cut_len]
-        req = Req(rid=i, origin_input_text=prompts[i], origin_input_ids=tmp_input_ids)
+        req = Req(
+            rid=i,
+            origin_input_text=prompts[i],
+            origin_input_ids=tmp_input_ids,
+            sampling_params=sampling_params,
+        )
         req.prefix_indices = []
-        req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
     return input_ids, reqs
@@ -178,6 +197,7 @@ def prepare_extend_inputs_for_correctness_test(
         req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
             i, : bench_args.cut_len
         ]
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
     return reqs
 
 
@@ -190,10 +210,15 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
 
     reqs = []
     for i in range(len(input_ids)):
-        req = Req(rid=i, origin_input_text="", origin_input_ids=list(input_ids[i]))
+        req = Req(
+            rid=i,
+            origin_input_text="",
+            origin_input_ids=list(input_ids[i]),
+            sampling_params=sampling_params,
+        )
         req.prefix_indices = []
-        req.sampling_params = sampling_params
         req.fill_ids = req.origin_input_ids
+        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
     return reqs
@@ -207,15 +232,19 @@ def extend(reqs, model_runner):
         tree_cache=None,
     )
     batch.prepare_for_extend(model_runner.model_config.vocab_size)
-    logits_output = model_runner.forward(batch)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    logits_output = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits, batch
 
 
 def decode(input_token_ids, batch, model_runner):
     batch.prepare_for_decode(input_token_ids)
-    logits_output = model_runner.forward(batch)
-    next_token_ids = model_runner.sample(logits_output, batch).tolist()
+    model_worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+    logits_output = model_runner.forward(forward_batch)
+    next_token_ids = model_runner.sample(logits_output, forward_batch).tolist()
     return next_token_ids, logits_output.next_token_logits
 
 
@@ -250,7 +279,7 @@ def correctness_test(
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0]):
+    for _ in range(bench_args.output_len[0] - 1):
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         for i in range(len(reqs)):
             output_ids[i].append(next_token_ids[i])
@@ -301,7 +330,7 @@ def latency_test_run_once(
 
     # Decode
     decode_latencies = []
-    for i in range(output_len):
+    for i in range(output_len - 1):
         torch.cuda.synchronize()
         tic = time.time()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
@@ -336,6 +365,7 @@ def latency_test(
     bench_args,
     tp_rank,
 ):
+    configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
     # Load the model
@@ -441,6 +471,7 @@ def plot_latency_test(
 
 
 def main(server_args, bench_args):
+    _set_envs_and_config(server_args)
 
     if server_args.model_path:
         if bench_args.correctness_test:
@@ -479,17 +510,10 @@ def main(server_args, bench_args):
 
 
 if __name__ == "__main__":
-    # TODO(kevin85421): Make the parser setup unit testable.
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     BenchArgs.add_cli_args(parser)
-    # For this script, model-path is not required
-    assert (
-        parser._actions[1].option_strings[0] == "--model-path"
-    ), "options changed, this code need to be updated"
-    parser._actions[1].required = False
     args = parser.parse_args()
-
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
 
@@ -498,4 +522,9 @@ if __name__ == "__main__":
         format="%(message)s",
     )
 
-    main(server_args, bench_args)
+    try:
+        main(server_args, bench_args)
+    except Exception as e:
+        raise e
+    finally:
+        kill_child_process(os.getpid(), including_parent=False)

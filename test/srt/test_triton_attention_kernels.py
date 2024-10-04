@@ -3,12 +3,14 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.triton_attention.decode_attention import decode_attention_fwd
-from sglang.srt.layers.triton_attention.extend_attention import (
+from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
+from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd,
     redundant_attention,
 )
-from sglang.srt.layers.triton_attention.prefill_attention import context_attention_fwd
+from sglang.srt.layers.attention.triton_ops.prefill_attention import (
+    context_attention_fwd,
+)
 
 
 class TestExtendAttention(unittest.TestCase):
@@ -127,7 +129,6 @@ class TestExtendAttention(unittest.TestCase):
 
     def _test_context_attention_once(self, head_dim):
         # Set up a simple test case
-        batch_size = 2
         num_heads = 4
         seq_lens = [8, 12]
         max_seq_len = max(seq_lens)

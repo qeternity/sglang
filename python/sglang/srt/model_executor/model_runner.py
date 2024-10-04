@@ -21,7 +21,7 @@ import importlib.resources
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Tuple, Type
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
@@ -38,27 +38,28 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
+from sglang.srt.constrained import disable_cache
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput, Sampler
+from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    enable_show_time_cost,
     get_available_gpu_memory,
     is_generation_model,
-    is_llama3_405b_fp8_head_16,
     is_multimodal_model,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
-    monkey_patch_vllm_qvk_linear_loader,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,23 +89,37 @@ class ModelRunner:
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
-        global_server_args_dict.update(
-            {
-                "attention_backend": server_args.attention_backend,
-                "sampling_backend": server_args.sampling_backend,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "enable_mla": server_args.enable_mla,
-                "torchao_config": server_args.torchao_config,
-            }
-        )
 
         # Model-specific adjustment
+        if (
+            self.model_config.attention_arch == AttentionArch.MLA
+            and not self.server_args.disable_mla
+        ):
+            logger.info("MLA optimization is tunred on. Use triton backend.")
+            self.server_args.attention_backend = "triton"
+
         if self.is_multimodal_model:
             logger.info(
                 "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
             )
             server_args.chunked_prefill_size = None
             server_args.mem_fraction_static *= 0.95
+
+        # Global vars
+        if server_args.show_time_cost:
+            enable_show_time_cost()
+        if server_args.disable_disk_cache:
+            disable_cache()
+
+        global_server_args_dict.update(
+            {
+                "attention_backend": server_args.attention_backend,
+                "sampling_backend": server_args.sampling_backend,
+                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+                "disable_mla": server_args.disable_mla,
+                "torchao_config": server_args.torchao_config,
+            }
+        )
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
@@ -129,8 +144,8 @@ class ModelRunner:
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
 
-        if self.server_args.nccl_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.nccl_init_addr}"
+        if self.server_args.dist_init_addr:
+            nccl_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
             nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
@@ -166,10 +181,13 @@ class ModelRunner:
         return min_per_gpu_memory
 
     def load_model(self):
-        torch.set_num_threads(1)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
         )
+
+        # This can reduce thread conflicts and speed up weight loading.
+        torch.set_num_threads(1)
+
         if torch.cuda.get_device_capability()[0] < 8:
             logger.info(
                 "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -178,6 +196,7 @@ class ModelRunner:
             if torch.cuda.get_device_capability()[1] < 5:
                 raise RuntimeError("SGLang only supports sm75 and above.")
 
+        # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
         self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
@@ -188,23 +207,16 @@ class ModelRunner:
             tokenizer_mode=None,
             trust_remote_code=self.server_args.trust_remote_code,
             dtype=self.server_args.dtype,
-            seed=42,
+            seed=self.server_args.random_seed,
             skip_tokenizer_init=True,
         )
-
-        # A temporary hack to fix the num_heads for meta-llama/Meta-Llama-3.1-405B-FP8 checkpoints
-        # Drop this after Sept, 2024.
-        if is_llama3_405b_fp8_head_16(self.model_config) and self.tp_size <= 8:
-            self.model_config.hf_config.num_key_value_heads = 8
-            self.vllm_model_config.hf_config.num_key_value_heads = 8
-            monkey_patch_vllm_qvk_linear_loader()
-
-        self.dtype = self.vllm_model_config.dtype
         if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
                 self.model_config.model_override_args
             )
+        self.dtype = self.vllm_model_config.dtype
 
+        # Load the model
         self.model = get_model(
             model_config=self.vllm_model_config,
             load_config=self.load_config,
@@ -219,6 +231,7 @@ class ModelRunner:
             if hasattr(self.model, "get_attention_sliding_window_size")
             else None
         )
+        self.has_cross_attention = getattr(self.model, "has_cross_attention", False)
         self.is_generation = is_generation_model(
             self.model_config.hf_config.architectures, self.server_args.is_embedding
         )
@@ -255,20 +268,20 @@ class ModelRunner:
                 tokenizer_mode=None,
                 trust_remote_code=self.server_args.trust_remote_code,
                 dtype=self.server_args.dtype,
-                seed=42,
+                seed=self.server_args.random_seed,
                 skip_tokenizer_init=True,
             )
         except Exception as e:
-            logger.error(f"Failed to load model config: {e}")
-            return False, "Failed to update model weights"
+            message = f"Failed to load model config: {e}."
+            return False, message
 
         load_config = LoadConfig(load_format=load_format)
 
         # Only support vllm DefaultModelLoader for now
         loader = get_model_loader(load_config)
         if not isinstance(loader, DefaultModelLoader):
-            logger.error("Failed to get weights iterator: Unsupported loader")
-            return False, "Failed to update model weights"
+            message = f"Failed to get model loader: {loader}."
+            return False, message
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
@@ -293,14 +306,14 @@ class ModelRunner:
             try:
                 iter = get_weight_iter(vllm_model_config)
             except Exception as e:
-                message = f"Failed to get weights iterator: {e}"
-                logger.error(message)
+                message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
-                message = f"Failed to update weights: {e}. \n Rolling back to original weights"
-                logger.error(message)
+                message = (
+                    f"Failed to update weights: {e}.\nRolling back to original weights."
+                )
                 del iter
                 gc.collect()
                 iter = get_weight_iter(self.vllm_model_config)
@@ -315,7 +328,7 @@ class ModelRunner:
         self.model_config.path = model_path
 
         logger.info("Update weights end.")
-        return True, "Succeeded to update model weights"
+        return True, "Succeeded to update model weights."
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -334,7 +347,7 @@ class ModelRunner:
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
@@ -397,12 +410,11 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs,
-            self.model_config.context_len + 8,
+            max_num_reqs + 1, self.model_config.context_len + 4, device="cuda"
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
-            and self.server_args.enable_mla
+            and not self.server_args.disable_mla
         ):
             self.token_to_kv_pool = MLATokenToKVPool(
                 self.max_total_num_tokens,
@@ -442,6 +454,10 @@ class ModelRunner:
                 "Window attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
+            assert not self.has_cross_attention, (
+                "Cross attention is not supported in the triton attention backend. "
+                "Please use `--attention-backend flashinfer`."
+            )
             self.attn_backend = TritonAttnBackend(self)
         else:
             raise ValueError(
@@ -464,88 +480,59 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
-    @torch.inference_mode()
-    def forward_decode(self, batch: ScheduleBatch):
-        if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(batch)
-
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
-            return self.cuda_graph_runner.replay(batch)
-
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
+    def forward_decode(self, forward_batch: ForwardBatch):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(
+            forward_batch.batch_size
+        ):
+            return self.cuda_graph_runner.replay(forward_batch)
 
         return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
+            forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    @torch.inference_mode()
-    def forward_extend(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(batch, input_metadata.extend_seq_lens)
-
+    def forward_extend(self, forward_batch: ForwardBatch):
         if self.is_generation:
             return self.model.forward(
-                batch.input_ids, input_metadata.positions, input_metadata
+                forward_batch.input_ids, forward_batch.positions, forward_batch
             )
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
-                batch.input_ids,
-                input_metadata.positions,
-                input_metadata,
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
                 get_embedding=True,
             )
 
-    @torch.inference_mode()
-    def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        return self.model.forward(
-            batch.input_ids,
-            input_metadata.positions,
-            input_metadata,
-            input_metadata.pixel_values,
-            input_metadata.image_sizes,
-            input_metadata.image_offsets,
-        )
-
-    def forward(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput]:
-        assert batch.forward_mode is not None
-
-        if self.is_multimodal_model and batch.forward_mode.is_extend():
-            return self.forward_extend_multi_modal(batch)
-        elif batch.forward_mode.is_decode():
-            return self.forward_decode(batch)
-        elif batch.forward_mode.is_extend():
-            return self.forward_extend(batch)
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        if forward_batch.forward_mode.is_decode():
+            return self.forward_decode(forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            return self.forward_extend(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
+            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
-    def _check_sample_results(self, sample_output: SampleOutput):
-        if not torch.all(sample_output.success):
-            probs = sample_output.probs
-            batch_next_token_ids = sample_output.batch_next_token_ids
-            logging.warning("Sampling failed, fallback to top_k=1 strategy")
-            probs = probs.masked_fill(torch.isnan(probs), 0.0)
-            argmax_ids = torch.argmax(probs, dim=-1)
-            batch_next_token_ids = torch.where(
-                sample_output.success, batch_next_token_ids, argmax_ids
-            )
-            sample_output.probs = probs
-            sample_output.batch_next_token_ids = batch_next_token_ids
+    def sample(
+        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
+        sampling_info = forward_batch.sampling_info
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.update_penalties()
+        logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
 
-        return sample_output.batch_next_token_ids
+        # Sample the next tokens.
+        next_token_ids = self.sampler(logits, sampling_info)
+        return next_token_ids
 
-    def _apply_logits_bias(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ):
+    def apply_logits_bias(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Apply logit_bias
         if sampling_info.logit_bias is not None:
             logits.add_(sampling_info.logit_bias)
 
         # min-token, presence, frequency
         if sampling_info.linear_penalties is not None:
-            logits += sampling_info.linear_penalties
+            logits.add_(sampling_info.linear_penalties)
 
         # repetition
         if sampling_info.scaling_penalties is not None:
@@ -561,17 +548,6 @@ class ModelRunner:
 
         return logits
 
-    def sample(
-        self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
-    ) -> torch.Tensor:
-        batch.sampling_info.update_regex_vocab_mask(batch)
-        batch.sampling_info.update_penalties()
-        logits = self._apply_logits_bias(
-            logits_output.next_token_logits, batch.sampling_info
-        )
-        sample_output = self.sampler(logits, batch.sampling_info)
-        return self._check_sample_results(sample_output)
-
 
 @lru_cache()
 def import_model_classes():
@@ -580,17 +556,25 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            module = importlib.import_module(name)
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
-                        assert tmp.__name__ not in model_arch_name_to_cls
+                        assert (
+                            tmp.__name__ not in model_arch_name_to_cls
+                        ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
-                    assert entry.__name__ not in model_arch_name_to_cls
+                    assert (
+                        entry.__name__ not in model_arch_name_to_cls
+                    ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls

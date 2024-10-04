@@ -21,6 +21,8 @@ import logging
 import random
 from typing import List, Optional, Union
 
+from sglang.srt.utils import is_hip, is_ipv6
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +61,7 @@ class ServerArgs:
     tp_size: int = 1
     stream_interval: int = 1
     random_seed: Optional[int] = None
+    constrained_json_whitespace_pattern: Optional[str] = None
 
     # Logging
     log_level: str = "info"
@@ -75,9 +78,9 @@ class ServerArgs:
     load_balance_method: str = "round_robin"
 
     # Distributed args
-    nccl_init_addr: Optional[str] = None
+    dist_init_addr: Optional[str] = None
     nnodes: int = 1
-    node_rank: Optional[int] = None
+    node_rank: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
@@ -94,11 +97,12 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
+    disable_mla: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
+    max_torch_compile_bs: int = 32
     torchao_config: str = ""
     enable_p2p_check: bool = False
-    enable_mla: bool = False
     triton_attention_reduce_in_fp32: bool = False
 
     # LoRA
@@ -152,11 +156,12 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        # Default kernel backends
-        if self.enable_mla:
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+        # ROCm: flashinfer available later
+        if is_hip():
             self.attention_backend = "triton"
+            self.sampling_backend = "pytorch"
 
+        # Default kernel backends
         if self.attention_backend is None:
             self.attention_backend = "flashinfer"
 
@@ -360,6 +365,12 @@ class ServerArgs:
             help="The random seed.",
         )
         parser.add_argument(
+            "--constrained-json-whitespace-pattern",
+            type=str,
+            default=ServerArgs.constrained_json_whitespace_pattern,
+            help=r"Regex pattern for syntactic whitespaces allowed in JSON constrained output. For example, to allow the model generate consecutive whitespaces, set the pattern to [\n\t ]*",
+        )
+        parser.add_argument(
             "--log-level",
             type=str,
             default=ServerArgs.log_level,
@@ -415,14 +426,17 @@ class ServerArgs:
 
         # Multi-node distributed serving args
         parser.add_argument(
-            "--nccl-init-addr",
+            "--dist-init-addr",
+            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
             type=str,
-            help="The nccl init address of multi-node server.",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
-        parser.add_argument("--node-rank", type=int, help="The node rank.")
+        parser.add_argument(
+            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
 
         # Model override args
         parser.add_argument(
@@ -489,6 +503,11 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
+            "--disable-mla",
+            action="store_true",
+            help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -497,6 +516,12 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--max-torch-compile-bs",
+            type=int,
+            default=ServerArgs.max_torch_compile_bs,
+            help="Set the maximum batch size when using torch compile.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -508,11 +533,6 @@ class ServerArgs:
             "--enable-p2p-check",
             action="store_true",
             help="Enable P2P check for GPU access, otherwise the p2p access is allowed by default.",
-        )
-        parser.add_argument(
-            "--enable-mla",
-            action="store_true",
-            help="Enable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
             "--triton-attention-reduce-in-fp32",
@@ -532,7 +552,8 @@ class ServerArgs:
             type=str,
             nargs="*",
             default=None,
-            help="The list of LoRA adapters.",
+            action=LoRAPathAction,
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
         )
         parser.add_argument(
             "--max-loras-per-batch",
@@ -549,7 +570,10 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        return f"http://{self.host}:{self.port}"
+        if is_ipv6(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            return f"http://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
@@ -564,6 +588,21 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+
+        assert self.dp_size == 1, (
+            "The support for data parallelism is temporarily disabled during refactor. "
+            "Please use sglang<=0.3.2 or wait for later updates."
+        )
+
+        if isinstance(self.lora_paths, list):
+            lora_paths = self.lora_paths
+            self.lora_paths = {}
+            for lora_path in lora_paths:
+                if "=" in lora_path:
+                    name, path = lora_path.split("=", 1)
+                    self.lora_paths[name] = path
+                else:
+                    self.lora_paths[lora_path] = lora_path
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
@@ -586,7 +625,22 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 @dataclasses.dataclass
 class PortArgs:
+    # The port for tokenizer to receive inputs from detokenizer (zmq)
     tokenizer_port: int
-    controller_port: int
+    # The port for scheduler to receive inputs from tokenizer (zmq)
+    scheduler_port: int
+    # The port for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_port: int
+    # The port for nccl initialization for multiple TP groups (torch.dist)
     nccl_ports: List[int]
+
+
+class LoRAPathAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, {})
+        for lora_path in values:
+            if "=" in lora_path:
+                name, path = lora_path.split("=", 1)
+                getattr(namespace, self.dest)[name] = path
+            else:
+                getattr(namespace, self.dest)[lora_path] = lora_path
