@@ -46,6 +46,8 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FlushCacheReq,
     GenerateReqInput,
+    GetMemPoolSizeReq,
+    GetMemPoolSizeReqOutput,
     ProfileReq,
     RewardReqInput,
     TokenizedEmbeddingReqInput,
@@ -56,7 +58,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import is_generation_model, is_multimodal_model
+from sglang.srt.utils import get_zmq_socket, is_generation_model, is_multimodal_model
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -84,11 +86,12 @@ class TokenizerManager:
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
-        self.recv_from_detokenizer = context.socket(zmq.PULL)
-        self.recv_from_detokenizer.bind(f"ipc://{port_args.tokenizer_ipc_name}")
-
-        self.send_to_scheduler = context.socket(zmq.PUSH)
-        self.send_to_scheduler.connect(f"ipc://{port_args.scheduler_input_ipc_name}")
+        self.recv_from_detokenizer = get_zmq_socket(
+            context, zmq.PULL, port_args.tokenizer_ipc_name
+        )
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name
+        )
 
         # Read model args
         self.model_path = server_args.model_path
@@ -122,7 +125,7 @@ class TokenizerManager:
 
                 # We want to parallelize the image pre-processing so we create an executor for it
                 self.image_processor = get_image_processor(
-                    self.hf_config, server_args, self.processor.image_processor
+                    self.hf_config, server_args, self.processor
                 )
             else:
                 self.tokenizer = get_tokenizer(
@@ -150,9 +153,13 @@ class TokenizerManager:
         while self.model_update_lock.locked():
             await asyncio.sleep(0.001)
 
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. Please add `--is-embedding` when launching the server or try another model."
+            )
+
         obj.post_init()
         is_single = obj.is_single
-
         if is_single:
             async for response in self._handle_single_request(obj, request):
                 yield response
@@ -187,8 +194,10 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params)
                 if self.is_generation:
                     image_inputs = await self.image_processor.process_images_async(
-                        obj.image_data, obj
+                        obj.image_data, input_text or input_ids, obj
                     )
+                    if image_inputs and "input_ids" in image_inputs:
+                        input_ids = image_inputs["input_ids"]
                     return_logprob = obj.return_logprob
                     logprob_start_len = obj.logprob_start_len
                     top_logprobs_num = obj.top_logprobs_num
@@ -213,8 +222,10 @@ class TokenizerManager:
                 sampling_params = self._get_sampling_params(obj.sampling_params[index])
                 if self.is_generation:
                     image_inputs = await self.image_processor.process_images_async(
-                        obj.image_data[index], obj
+                        obj.image_data[index], input_text or input_ids, obj
                     )
+                    if image_inputs and "input_ids" in image_inputs:
+                        input_ids = image_inputs["input_ids"]
                     return_logprob = obj.return_logprob[index]
                     logprob_start_len = obj.logprob_start_len[index]
                     top_logprobs_num = obj.top_logprobs_num[index]
@@ -259,8 +270,10 @@ class TokenizerManager:
             sampling_params = SamplingParams(**obj.sampling_params[0])
             sampling_params.max_new_tokens = 0
             image_inputs = await self.image_processor.process_images_async(
-                obj.image_data[0], obj
+                obj.image_data[0], input_text or input_ids, obj
             )
+            if image_inputs and "input_ids" in image_inputs:
+                input_ids = image_inputs["input_ids"]
             return_logprob = obj.return_logprob[0]
             logprob_start_len = obj.logprob_start_len[0]
             top_logprobs_num = obj.top_logprobs_num[0]
@@ -521,6 +534,15 @@ class TokenizerManager:
         req = ProfileReq.STOP_PROFILE
         self.send_to_scheduler.send_pyobj(req)
 
+    async def get_memory_pool_size(self):
+        if self.to_create_loop:
+            self.create_handle_loop()
+
+        req = GetMemPoolSizeReq()
+        self.send_to_scheduler.send_pyobj(req)
+        self.mem_pool_size = asyncio.Future()
+        return await self.mem_pool_size
+
     async def update_weights(
         self, obj: UpdateWeightReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -550,7 +572,7 @@ class TokenizerManager:
     def create_abort_task(self, obj: GenerateReqInput):
         # Abort the request if the client is disconnected.
         async def abort_request():
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             if obj.is_single:
                 self.abort_request(obj.rid)
             else:
@@ -580,6 +602,9 @@ class TokenizerManager:
             if isinstance(recv_obj, UpdateWeightReqOutput):
                 self.model_update_result.set_result(recv_obj)
                 continue
+            elif isinstance(recv_obj, GetMemPoolSizeReqOutput):
+                self.mem_pool_size.set_result(recv_obj)
+                continue
 
             assert isinstance(
                 recv_obj, (BatchStrOut, BatchEmbeddingOut, BatchTokenIDOut)
@@ -597,11 +622,8 @@ class TokenizerManager:
                         "meta_info": recv_obj.meta_info[i],
                     }
                 elif isinstance(recv_obj, BatchTokenIDOut):
-                    read_start = 0 if i == 0 else recv_obj.read_offsets[i - 1]
                     out_dict = {
-                        "token_ids": recv_obj.decode_ids[
-                            read_start : recv_obj.read_offsets[i]
-                        ],
+                        "token_ids": recv_obj.output_ids[i],
                         "meta_info": recv_obj.meta_info[i],
                     }
 
