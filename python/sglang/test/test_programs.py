@@ -550,3 +550,23 @@ def test_gen_min_new_tokens():
 
     state = convo_1.run()
     assert_min_tokens(tokenizer, state["answer"])
+
+
+def test_select_high_concurrency():
+    @sgl.function
+    def select_high_concurrency(s):
+        s += sgl.system("You are a helpful assistant.")
+        s += sgl.user(
+            "Shopping list:\n1. Milk\n2. Bread\n3. Eggs\n\nHow many items are on the shopping list?"
+        )
+        s += sgl.assistant(
+            "There are " + sgl.select("answer", choices=[str(i) for i in range(5)])
+        )
+
+    states = select_high_concurrency.run_batch(
+        [{} for _ in range(32)],
+        temperature=0,
+        num_threads=8,
+    )
+
+    assert all(state["answer"] == "3" for state in states)

@@ -20,6 +20,7 @@ from sglang.test.test_programs import (
     test_select,
     test_stream,
     test_tool_use,
+    test_select_high_concurrency,
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
@@ -77,6 +78,9 @@ class TestSRTBackend(unittest.TestCase):
 
     def test_gen_min_new_tokens(self):
         test_gen_min_new_tokens()
+
+    def test_select_high_concurrency(self):
+        test_select_high_concurrency()
 
 
 if __name__ == "__main__":
