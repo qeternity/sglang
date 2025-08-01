@@ -1308,7 +1308,17 @@ def _per_token_group_quant_fp8_hopper_moe_mn_major(
         inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
         inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
         inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
-        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
+        # Use appropriate FP8 dtype based on GPU architecture
+        if _is_hip:
+            # AMD GPUs support fp8e4b15
+            inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4b15)
+        else:
+            # NVIDIA: Use fp8e4nv only on supported architectures, otherwise fp8e4b15
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 9 or capability == (8, 9):
+                inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4nv)
+            else:
+                inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(tl.float8e4b15)
 
         # Store fp8
         a_fp8_ptrs = (

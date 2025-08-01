@@ -20,7 +20,108 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, set_weight_attrs, get_bool_env_var
+from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
+
+try:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        apply_fp8_marlin_linear,
+    )
+    MARLIN_FP8_AVAILABLE = True
+except ImportError:
+    MARLIN_FP8_AVAILABLE = False
+    apply_fp8_marlin_linear = None
+
+
+def _should_use_marlin_moe() -> bool:
+    """Check if we should use Marlin kernels for MOE on this hardware."""
+    if is_hip():
+        return False  # Marlin disabled for ROCm
+    
+    cutlass_supported = cutlass_fp8_supported()
+    marlin_forced = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
+    
+    # Use Marlin if:
+    # 1. Cutlass FP8 is not supported (RTX 3090, etc.) AND Marlin is available, OR
+    # 2. Marlin is explicitly forced via environment variable
+    return (not cutlass_supported and MARLIN_FP8_AVAILABLE) or marlin_forced
+
+
+def _supports_cutlass_fp8() -> bool:
+    """Check if the current GPU supports Cutlass FP8 kernels."""
+    return cutlass_fp8_supported()
+
+
+def _marlin_moe_forward(
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    w13_workspace: torch.Tensor,
+    w2_workspace: torch.Tensor,
+    topk_output: "TopKOutput",
+    activation: str = "silu",
+) -> torch.Tensor:
+    """Perform MOE forward pass using Marlin kernels for weight-only FP8."""
+    if not MARLIN_FP8_AVAILABLE:
+        raise RuntimeError("Marlin FP8 not available, but trying to use Marlin MOE")
+    
+    topk_weights, topk_ids, _ = topk_output
+    batch_size, hidden_size = x.shape
+    num_experts, intermediate_size = w13_weight.shape[0], w13_weight.shape[1] // 2
+    top_k = topk_ids.shape[1]
+    
+    # Initialize output
+    output = torch.zeros_like(x)
+    
+    # Process each token
+    for token_idx in range(batch_size):
+        token_input = x[token_idx:token_idx+1]  # [1, hidden_size]
+        
+        for k in range(top_k):
+            expert_idx = topk_ids[token_idx, k].item()
+            weight = topk_weights[token_idx, k].item()
+            
+            if weight == 0:
+                continue
+                
+            # Gate and up projections (w13) - Marlin linear
+            w13_out = apply_fp8_marlin_linear(
+                input=token_input,
+                weight=w13_weight[expert_idx],
+                weight_scale=w13_weight_scale[expert_idx],
+                workspace=w13_workspace,
+                size_n=intermediate_size * 2,
+                size_k=hidden_size,
+                bias=None,
+            )
+            
+            # Split gate and up, apply activation
+            gate, up = w13_out.chunk(2, dim=-1)
+            if activation == "silu":
+                activated = torch.nn.functional.silu(gate) * up
+            elif activation == "gelu":
+                activated = torch.nn.functional.gelu(gate) * up
+            else:
+                raise ValueError(f"Unsupported activation: {activation}")
+            
+            # Down projection (w2) - Marlin linear  
+            expert_out = apply_fp8_marlin_linear(
+                input=activated,
+                weight=w2_weight[expert_idx], 
+                weight_scale=w2_weight_scale[expert_idx],
+                workspace=w2_workspace,
+                size_n=hidden_size,
+                size_k=intermediate_size,
+                bias=None,
+            )
+            
+            # Accumulate weighted expert output
+            output[token_idx] += weight * expert_out.squeeze(0)
+    
+    return output
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -189,6 +290,20 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
+        # Create workspace tensors for Marlin kernels if needed
+        if _should_use_marlin_moe():
+            # Marlin workspace for w13 weights (gate + up)
+            w13_workspace = torch.zeros(
+                2 * intermediate_size_per_partition // 64 * 16, dtype=torch.int, device="cuda"
+            )
+            layer.register_buffer("w13_workspace", w13_workspace)
+            
+            # Marlin workspace for w2 weights (down)
+            w2_workspace = torch.zeros(
+                hidden_size // 64 * 16, dtype=torch.int, device="cuda"
+            )
+            layer.register_buffer("w2_workspace", w2_workspace)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
@@ -264,6 +379,41 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
+        # Prepare weights for Marlin if needed
+        if _should_use_marlin_moe():
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+                prepare_fp8_layer_for_marlin,
+            )
+            
+            # Process each expert's weights for Marlin
+            for expert_id in range(layer.w13_weight.shape[0]):
+                # Create temporary layer objects for each expert to use vLLM's prepare function
+                temp_w13_layer = type('TempLayer', (), {})()
+                temp_w13_layer.weight = layer.w13_weight[expert_id].t()  # Marlin expects transposed weights
+                temp_w13_layer.weight_scale = layer.w13_weight_scale[expert_id].unsqueeze(-1)
+                temp_w13_layer.input_size_per_partition = layer.w13_weight.shape[-1]
+                temp_w13_layer.output_size_per_partition = layer.w13_weight.shape[1]
+                temp_w13_layer.workspace = layer.w13_workspace
+                
+                prepare_fp8_layer_for_marlin(temp_w13_layer, size_k_first=True)
+                
+                # Update the original weights
+                layer.w13_weight[expert_id] = temp_w13_layer.weight.t()
+                layer.w13_weight_scale[expert_id] = temp_w13_layer.weight_scale.squeeze(-1)
+                
+                # Same for w2 weights
+                temp_w2_layer = type('TempLayer', (), {})()
+                temp_w2_layer.weight = layer.w2_weight[expert_id].t()
+                temp_w2_layer.weight_scale = layer.w2_weight_scale[expert_id].unsqueeze(-1)
+                temp_w2_layer.input_size_per_partition = layer.w2_weight.shape[-1]
+                temp_w2_layer.output_size_per_partition = layer.w2_weight.shape[1]
+                temp_w2_layer.workspace = layer.w2_workspace
+                
+                prepare_fp8_layer_for_marlin(temp_w2_layer, size_k_first=True)
+                
+                layer.w2_weight[expert_id] = temp_w2_layer.weight.t()
+                layer.w2_weight_scale[expert_id] = temp_w2_layer.weight_scale.squeeze(-1)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -278,23 +428,48 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton import fused_experts
 
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_output=topk_output,
-            inplace=inplace,
-            activation=activation,
-            use_fp8_w8a8=True,
-            per_channel_quant=self.weight_quant.strategy
-            == QuantizationStrategy.CHANNEL,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        # Check which path to use based on hardware capabilities
+        use_marlin = _should_use_marlin_moe()
+        supports_cutlass = _supports_cutlass_fp8()
+        
+        if use_marlin:
+            # Use Marlin kernels for weight-only FP8 (RTX 3090, etc.)
+            return _marlin_moe_forward(
+                x=x,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=layer.w13_weight_scale,
+                w2_weight_scale=layer.w2_weight_scale,
+                w13_workspace=layer.w13_workspace,
+                w2_workspace=layer.w2_workspace,
+                topk_output=topk_output,
+                activation=activation,
+            )
+        elif supports_cutlass:
+            # Use native FP8 Triton kernels (H100, RTX 4090, etc.)
+            return fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_output=topk_output,
+                inplace=inplace,
+                activation=activation,
+                use_fp8_w8a8=True,
+                per_channel_quant=self.weight_quant.strategy
+                == QuantizationStrategy.CHANNEL,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            # Fallback - should not reach here for FP8 compressed tensors
+            raise RuntimeError(
+                "No supported FP8 path available. Please ensure proper hardware support "
+                "or set SGLANG_FORCE_FP8_MARLIN=1 for weight-only FP8 on older hardware."
+            )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
