@@ -49,9 +49,11 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
+    marlin_fp8_block_to_channel,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -67,6 +69,7 @@ from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_capability,
     is_cpu,
     is_cuda,
     is_hip,
@@ -211,17 +214,13 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
-        self.use_marlin = (
-            get_bool_env_var("SGLANG_FORCE_FP8_MARLIN") and MARLIN_FP8_AVAILABLE
-        )
-        # Disable marlin for ROCm
-        if _is_hip:
-            self.use_marlin = False
+        self.use_marlin = False
+        if _is_cuda and MARLIN_FP8_AVAILABLE:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
 
         self.block_quant = self.quant_config.weight_block_size is not None
-        if self.block_quant:
-            # Marlin doesn't support block-wise fp8
-            self.use_marlin = False
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -351,6 +350,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     _is_cpu_amx_available
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["weight"])
+                return
+            elif self.use_marlin:
+                weight, weight_scale = marlin_fp8_block_to_channel(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size,
+                )
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                layer.weight_scale = torch.nn.Parameter(
+                    weight_scale, requires_grad=False
+                )
+                layer.input_scale = None
+                prepare_fp8_layer_for_marlin(layer)
+                self.block_quant = False
                 return
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data

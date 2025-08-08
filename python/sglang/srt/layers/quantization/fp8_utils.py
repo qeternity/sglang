@@ -747,3 +747,26 @@ def apply_fp8_linear(
                 bias,
                 input.dtype,
             )
+
+
+def can_auto_enable_marlin_fp8() -> bool:
+    try:
+        major, minor = get_device_capability()
+        sm = major * 10 + minor
+        return 80 <= sm < 89
+    except:
+        return False
+
+
+def marlin_fp8_block_to_channel(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_size: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    w_deq = block_quant_dequant(
+        weight, weight_scale_inv, block_size, dtype=torch.float16
+    )
+    w_quant, w_scale = sglang_per_token_group_quant_fp8(
+        w_deq, w_deq.shape[-1], column_major_scales=False
+    )
+    return w_quant.t().contiguous(), w_scale.t().contiguous()
