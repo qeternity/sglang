@@ -136,9 +136,9 @@ def prepare_fp8_layer_for_marlin(
     # WEIGHT SCALES
     # Permute scales
     if "weight_scale" in dir(layer):
-        scales = layer.weight_scale.to(layer.orig_dtype)
+        scales = layer.weight_scale.to(torch.float16)
     elif "weight_scale_inv" in dir(layer):
-        scales = layer.weight_scale_inv.to(layer.orig_dtype)
+        scales = layer.weight_scale_inv.to(torch.float16)
         del layer.weight_scale_inv
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
@@ -276,11 +276,11 @@ def prepare_moe_fp8_layer_for_marlin(
     for name in ["w13", "w2"]:
         if name + "_weight_scale" in dir(layer):
             new_name = name + "_weight_scale"
-            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            scales = getattr(layer, new_name).to(torch.float16)
             delattr(layer, new_name)
         elif name + "_weight_scale_inv" in dir(layer):
             new_name = name + "_weight_scale_inv"
-            scales = getattr(layer, new_name).to(layer.orig_dtype)
+            scales = getattr(layer, new_name).to(torch.float16)
             delattr(layer, new_name)
 
         tensor_list = []
