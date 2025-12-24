@@ -76,17 +76,12 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             )
         size_k_first = False
         transpose_qweight = True
-        if (
-            layer.__class__.__name__ == "RowParallelLinear"
-            and layer.input_size_per_partition == layer.output_size_per_partition
-        ):
-            # Known Marlin mismatch for square RowParallelLinear (e.g., o_proj).
-            # Fall back to dequantized matmul for correctness.
-            layer.fp8_marlin_fallback = True
-            logger.warning(
-                "CompressedTensorsW8A16Fp8: enable fp8_marlin_fallback for layer=%s",
-                getattr(layer, "prefix", layer.__class__.__name__),
-            )
+        # Debug: force fallback for all layers to isolate Marlin issues.
+        layer.fp8_marlin_fallback = True
+        logger.warning(
+            "CompressedTensorsW8A16Fp8: enable fp8_marlin_fallback for layer=%s",
+            getattr(layer, "prefix", layer.__class__.__name__),
+        )
         prepare_fp8_layer_for_marlin(
             layer,
             size_k_first=size_k_first,
