@@ -100,6 +100,7 @@ def apply_fp8_marlin_linear(
 def prepare_fp8_layer_for_marlin(
     layer: torch.nn.Module, size_k_first: bool = True
 ) -> None:
+    layer_name = getattr(layer, "prefix", None)
     logger.warning_once(
         "Your GPU does not have native support for FP8 computation but "
         "FP8 quantization is being used. Weight-only FP8 compression will "
@@ -118,7 +119,8 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
     logger.info_once(
-        "Marlin FP8 prep: weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s",
+        "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s",
+        layer_name,
         tuple(layer.weight.shape),
         layer.weight.dtype,
         part_size_k,
@@ -162,7 +164,8 @@ def prepare_fp8_layer_for_marlin(
     else:
         scale_min = scale_max = scale_mean = None
     logger.info_once(
-        "Marlin FP8 prep: scales shape=%s dtype=%s group_size=%s min=%s max=%s mean=%s",
+        "Marlin FP8 prep: layer=%s scales shape=%s dtype=%s group_size=%s min=%s max=%s mean=%s",
+        layer_name,
         tuple(scales.shape),
         scales.dtype,
         group_size,
@@ -216,7 +219,8 @@ def prepare_fp8_layer_for_marlin(
         scales_min = scales_max = scales_mean = None
         num_inf = num_nan = 0
     logger.info_once(
-        "Marlin FP8 prep: fused scales shape=%s dtype=%s min=%s max=%s mean=%s inf=%s nan=%s",
+        "Marlin FP8 prep: layer=%s fused scales shape=%s dtype=%s min=%s max=%s mean=%s inf=%s nan=%s",
+        layer_name,
         tuple(marlin_scales.shape),
         marlin_scales.dtype,
         scales_min,
@@ -325,9 +329,10 @@ def prepare_fp8_layer_for_marlin(
         err_raw_inv = (marlin_out_raw - ref_t_inv).abs().max().item()
         err_no_t = (marlin_out - ref_no_t).abs().max().item()
         logger.info_once(
-            "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
+            "Marlin FP8 debug: layer=%s max_abs_err perm_scale=%s perm_inv=%s "
             "perm_scale*448=%s perm_scale/448=%s perm_scale*256=%s "
             "perm_scale/256=%s raw_scale=%s raw_inv=%s no_t=%s",
+            layer_name,
             err,
             err_inv,
             err_scale_448,
@@ -338,6 +343,13 @@ def prepare_fp8_layer_for_marlin(
             err_raw_inv,
             err_no_t,
         )
+        if err > 0.05:
+            logger.warning(
+                "Marlin FP8 debug: layer=%s large error (perm_scale=%s). "
+                "Check scale semantics or packing.",
+                layer_name,
+                err,
+            )
 
 
 def prepare_moe_fp8_layer_for_marlin(
