@@ -194,6 +194,9 @@ def prepare_fp8_layer_for_marlin(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
+    # FP8 scales from compressed-tensors are in FP8 dynamic format (amax/448).
+    # Marlin expects a direct scaling factor, so normalize by 448.
+    marlin_scales = marlin_scales / 448.0
     if marlin_scales.numel() > 0:
         scales_min = marlin_scales.min().item()
         scales_max = marlin_scales.max().item()
