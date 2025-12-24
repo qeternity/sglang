@@ -75,13 +75,19 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 layer.input_scale.data, requires_grad=False
             )
         size_k_first = False
+        transpose_qweight = True
         if (
             layer.__class__.__name__ == "RowParallelLinear"
             and layer.input_size_per_partition == layer.output_size_per_partition
         ):
-            # Row-parallel square weights need K-first packing to match F.linear.
-            size_k_first = True
-        prepare_fp8_layer_for_marlin(layer, size_k_first=size_k_first)
+            # For square row-parallel layers, avoid the extra transpose so the
+            # Marlin output matches F.linear's weight orientation.
+            transpose_qweight = False
+        prepare_fp8_layer_for_marlin(
+            layer,
+            size_k_first=size_k_first,
+            transpose_qweight=transpose_qweight,
+        )
 
     def create_weights(
         self,

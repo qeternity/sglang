@@ -98,7 +98,9 @@ def apply_fp8_marlin_linear(
 
 
 def prepare_fp8_layer_for_marlin(
-    layer: torch.nn.Module, size_k_first: bool = True
+    layer: torch.nn.Module,
+    size_k_first: bool = True,
+    transpose_qweight: bool = True,
 ) -> None:
     layer_name = getattr(layer, "prefix", None)
     if layer_name is None:
@@ -121,7 +123,7 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
     logger.info(
-        "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s size_k_first=%s",
+        "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s size_k_first=%s transpose_qweight=%s",
         layer_name,
         tuple(layer.weight.shape),
         layer.weight.dtype,
@@ -129,6 +131,7 @@ def prepare_fp8_layer_for_marlin(
         part_size_n,
         weight_block_size,
         size_k_first,
+        transpose_qweight,
     )
 
     # WORKSPACE
@@ -139,7 +142,7 @@ def prepare_fp8_layer_for_marlin(
     perm = torch.empty(0, dtype=torch.int, device=device)
     orig_weight = layer.weight
     qweight = pack_fp8_to_int32(orig_weight, size_k_first)
-    if not size_k_first:
+    if not size_k_first and transpose_qweight:
         qweight = qweight.T.contiguous()
 
     marlin_qweight = gptq_marlin_repack(
