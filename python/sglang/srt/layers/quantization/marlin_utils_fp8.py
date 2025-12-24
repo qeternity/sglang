@@ -121,13 +121,14 @@ def prepare_fp8_layer_for_marlin(
 
     device = layer.weight.device
     logger.info(
-        "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s",
+        "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s size_k_first=%s",
         layer_name,
         tuple(layer.weight.shape),
         layer.weight.dtype,
         part_size_k,
         part_size_n,
         weight_block_size,
+        size_k_first,
     )
 
     # WORKSPACE

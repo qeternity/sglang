@@ -74,7 +74,14 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer, size_k_first=False)
+        size_k_first = False
+        if (
+            layer.__class__.__name__ == "RowParallelLinear"
+            and layer.input_size_per_partition == layer.output_size_per_partition
+        ):
+            # Row-parallel square weights need K-first packing to match F.linear.
+            size_k_first = True
+        prepare_fp8_layer_for_marlin(layer, size_k_first=size_k_first)
 
     def create_weights(
         self,
