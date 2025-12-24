@@ -56,8 +56,15 @@ def apply_fp8_marlin_linear(
     # For GPUs that lack FP8 hardware support, we can leverage the
     # Marlin kernel for fast weight-only FP8 quantization
 
-    reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
+    orig_dtype = input.dtype
+    if orig_dtype == torch.bfloat16:
+        input = input.to(torch.float16)
+        weight_scale = weight_scale.to(torch.float16)
+        if bias is not None:
+            bias = bias.to(torch.float16)
+
+    reshaped_x = input.reshape(-1, input.shape[-1])
 
     use_atomic_add = should_use_atomic_add_reduce(
         m=reshaped_x.size(0), n=size_n, k=size_k, device=input.device, dtype=input.dtype
@@ -84,7 +91,10 @@ def apply_fp8_marlin_linear(
     if bias is not None:
         output.add_(bias)
 
-    return output.reshape(out_shape)
+    output = output.reshape(out_shape)
+    if output.dtype != orig_dtype:
+        output = output.to(orig_dtype)
+    return output
 
 
 def prepare_fp8_layer_for_marlin(
