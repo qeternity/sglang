@@ -29,7 +29,10 @@ def fp8_fused_exponent_bias_into_scales(scales):
     if scales.dtype == torch.half:
         target_exponent = 5
     elif scales.dtype == torch.bfloat16:
-        target_exponent = 8
+        # Avoid massive exponent bias amplification for bf16 scales.
+        # Marlin expects reasonable-scale values; bf16 biasing here
+        # can explode scales and corrupt outputs.
+        return scales
     # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
     # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
