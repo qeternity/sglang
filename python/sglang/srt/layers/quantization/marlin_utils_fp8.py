@@ -194,9 +194,6 @@ def prepare_fp8_layer_for_marlin(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
-    # FP8 scales from compressed-tensors are in FP8 dynamic format (amax/448).
-    # Marlin expects a direct scaling factor, so normalize by 448.
-    marlin_scales = marlin_scales / 448.0
     if marlin_scales.numel() > 0:
         scales_min = marlin_scales.min().item()
         scales_max = marlin_scales.max().item()
@@ -235,11 +232,27 @@ def prepare_fp8_layer_for_marlin(
         w_scaled_inv = weight_fp32 * (1.0 / scales_fp32)
         w_scaled_448 = weight_fp32 * (scales_fp32 * 448.0)
         w_scaled_div_448 = weight_fp32 * (scales_fp32 / 448.0)
-        ref_t = x @ w_scaled.t()
-        ref_t_inv = x @ w_scaled_inv.t()
-        ref_t_448 = x @ w_scaled_448.t()
-        ref_t_div_448 = x @ w_scaled_div_448.t()
-        ref_no_t = x @ w_scaled
+        w_scaled_t = w_scaled.t()
+        w_scaled_inv_t = w_scaled_inv.t()
+        w_scaled_448_t = w_scaled_448.t()
+        w_scaled_div_448_t = w_scaled_div_448.t()
+        ref_t = x @ w_scaled_t if x.shape[1] == w_scaled_t.shape[0] else x @ w_scaled
+        ref_t_inv = (
+            x @ w_scaled_inv_t
+            if x.shape[1] == w_scaled_inv_t.shape[0]
+            else x @ w_scaled_inv
+        )
+        ref_t_448 = (
+            x @ w_scaled_448_t
+            if x.shape[1] == w_scaled_448_t.shape[0]
+            else x @ w_scaled_448
+        )
+        ref_t_div_448 = (
+            x @ w_scaled_div_448_t
+            if x.shape[1] == w_scaled_div_448_t.shape[0]
+            else x @ w_scaled_div_448
+        )
+        ref_no_t = x @ w_scaled if x.shape[1] == w_scaled.shape[0] else x @ w_scaled_t
         marlin_out = gptq_marlin_gemm(
             a=x.to(torch.float16),
             c=None,
