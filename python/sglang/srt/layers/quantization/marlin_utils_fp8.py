@@ -255,8 +255,15 @@ def prepare_fp8_layer_for_marlin(
         x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
         weight_fp32 = orig_weight.to(torch.float32)
         scales_fp32 = scales.to(torch.float32)
-        if weight_fp32.shape[0] != scales_fp32.shape[0]:
-            weight_fp32 = weight_fp32.t()
+        # Align scales with weight's output dimension for elementwise scale.
+        if scales_fp32.ndim == 2 and scales_fp32.shape[0] == 1:
+            # scales are (1, size_n)
+            if weight_fp32.shape[1] != scales_fp32.shape[1]:
+                weight_fp32 = weight_fp32.t()
+        else:
+            # scales are (size_n, 1)
+            if weight_fp32.shape[0] != scales_fp32.shape[0]:
+                weight_fp32 = weight_fp32.t()
         w_scaled = weight_fp32 * scales_fp32
         w_scaled_inv = weight_fp32 * (1.0 / scales_fp32)
         w_scaled_448 = weight_fp32 * (scales_fp32 * 448.0)
