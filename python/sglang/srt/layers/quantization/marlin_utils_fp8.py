@@ -120,7 +120,8 @@ def prepare_fp8_layer_for_marlin(
     # WEIGHT
     # Repack weights to marlin format
     perm = torch.empty(0, dtype=torch.int, device=device)
-    qweight = pack_fp8_to_int32(layer.weight, size_k_first)
+    orig_weight = layer.weight
+    qweight = pack_fp8_to_int32(orig_weight, size_k_first)
     if not size_k_first:
         qweight = qweight.T.contiguous()
 
@@ -217,6 +218,40 @@ def prepare_fp8_layer_for_marlin(
         assert layer.bias.shape == (part_size_n,)
         bias = marlin_permute_bias(layer.bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+    if get_bool_env_var("SGLANG_FP8_MARLIN_DEBUG"):
+        with torch.no_grad():
+            # Compare Marlin output to reference dequantized matmul to validate scale semantics.
+            m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
+            x = torch.randn((m, part_size_k), device=device, dtype=torch.float16)
+            weight_fp16 = orig_weight.to(torch.float16)
+            scales_fp16 = scales.to(torch.float16)
+            ref = x @ (weight_fp16 * scales_fp16)
+            ref_inv = x @ (weight_fp16 * (1.0 / scales_fp16))
+            marlin_out = gptq_marlin_gemm(
+                a=x,
+                c=None,
+                b_q_weight=marlin_qweight,
+                b_scales=marlin_scales.to(torch.float16),
+                global_scale=None,
+                b_zeros=None,
+                g_idx=None,
+                perm=None,
+                workspace=layer.workspace,
+                b_q_type=scalar_types.float8_e4m3fn,
+                size_m=m,
+                size_n=part_size_n,
+                size_k=part_size_k,
+                use_atomic_add=False,
+                use_fp32_reduce=False,
+            )
+            err = (marlin_out - ref).abs().max().item()
+            err_inv = (marlin_out - ref_inv).abs().max().item()
+            logger.info_once(
+                "Marlin FP8 debug: max_abs_err scale=%s inv_scale=%s",
+                err,
+                err_inv,
+            )
 
 
 def prepare_moe_fp8_layer_for_marlin(
