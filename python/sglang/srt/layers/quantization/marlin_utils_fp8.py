@@ -28,17 +28,19 @@ def fp8_fused_exponent_bias_into_scales(scales):
     fp8_exponent = 4
     if scales.dtype == torch.half:
         target_exponent = 5
+        work_scales = scales
     elif scales.dtype == torch.bfloat16:
-        # Avoid massive exponent bias amplification for bf16 scales.
-        # Marlin expects reasonable-scale values; bf16 biasing here
-        # can explode scales and corrupt outputs.
+        # Use fp16 exponent bias to avoid bf16-scale explosion, then cast back.
+        target_exponent = 5
+        work_scales = scales.to(torch.float16)
+    else:
         return scales
     # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
     # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
-    s = torch.ones_like(scales) * 2
+    s = torch.ones_like(work_scales) * 2
     s = s**exponent_bias
-    return scales * s
+    return (work_scales * s).to(scales.dtype)
 
 
 def apply_fp8_marlin_linear(
@@ -136,9 +138,9 @@ def prepare_fp8_layer_for_marlin(
     # WEIGHT SCALES
     # Permute scales
     if "weight_scale" in dir(layer):
-        scales = layer.weight_scale.to(torch.float16)
+        scales = layer.weight_scale.to(layer.orig_dtype)
     elif "weight_scale_inv" in dir(layer):
-        scales = layer.weight_scale_inv.to(torch.float16)
+        scales = layer.weight_scale_inv.to(layer.orig_dtype)
         del layer.weight_scale_inv
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
@@ -276,11 +278,11 @@ def prepare_moe_fp8_layer_for_marlin(
     for name in ["w13", "w2"]:
         if name + "_weight_scale" in dir(layer):
             new_name = name + "_weight_scale"
-            scales = getattr(layer, new_name).to(torch.float16)
+            scales = getattr(layer, new_name).to(layer.orig_dtype)
             delattr(layer, new_name)
         elif name + "_weight_scale_inv" in dir(layer):
             new_name = name + "_weight_scale_inv"
-            scales = getattr(layer, new_name).to(torch.float16)
+            scales = getattr(layer, new_name).to(layer.orig_dtype)
             delattr(layer, new_name)
 
         tensor_list = []
