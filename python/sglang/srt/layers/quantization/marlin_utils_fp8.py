@@ -39,7 +39,7 @@ def fp8_fused_exponent_bias_into_scales(scales):
         return scales
     s = torch.ones_like(work_scales) * 2
     s = s**exponent_bias
-    logger.info_once("Marlin FP8: folding exponent-bias into scales (x256)")
+    logger.info("Marlin FP8: folding exponent-bias into scales (x256)")
     return (work_scales * s).to(scales.dtype)
 
 
@@ -101,6 +101,8 @@ def prepare_fp8_layer_for_marlin(
     layer: torch.nn.Module, size_k_first: bool = True
 ) -> None:
     layer_name = getattr(layer, "prefix", None)
+    if layer_name is None:
+        layer_name = f"{layer.__class__.__name__}@{id(layer)}"
     logger.warning_once(
         "Your GPU does not have native support for FP8 computation but "
         "FP8 quantization is being used. Weight-only FP8 compression will "
@@ -118,7 +120,7 @@ def prepare_fp8_layer_for_marlin(
         assert layer.weight.shape == (part_size_n, part_size_k)
 
     device = layer.weight.device
-    logger.info_once(
+    logger.info(
         "Marlin FP8 prep: layer=%s weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s",
         layer_name,
         tuple(layer.weight.shape),
@@ -163,7 +165,7 @@ def prepare_fp8_layer_for_marlin(
         scale_mean = scales.mean().item()
     else:
         scale_min = scale_max = scale_mean = None
-    logger.info_once(
+    logger.info(
         "Marlin FP8 prep: layer=%s scales shape=%s dtype=%s group_size=%s min=%s max=%s mean=%s",
         layer_name,
         tuple(scales.shape),
@@ -218,7 +220,7 @@ def prepare_fp8_layer_for_marlin(
     else:
         scales_min = scales_max = scales_mean = None
         num_inf = num_nan = 0
-    logger.info_once(
+    logger.info(
         "Marlin FP8 prep: layer=%s fused scales shape=%s dtype=%s min=%s max=%s mean=%s inf=%s nan=%s",
         layer_name,
         tuple(marlin_scales.shape),
@@ -328,7 +330,7 @@ def prepare_fp8_layer_for_marlin(
         err_raw = (marlin_out_raw - ref_t).abs().max().item()
         err_raw_inv = (marlin_out_raw - ref_t_inv).abs().max().item()
         err_no_t = (marlin_out - ref_no_t).abs().max().item()
-        logger.info_once(
+        logger.info(
             "Marlin FP8 debug: layer=%s max_abs_err perm_scale=%s perm_inv=%s "
             "perm_scale*448=%s perm_scale/448=%s perm_scale*256=%s "
             "perm_scale/256=%s raw_scale=%s raw_inv=%s no_t=%s",
