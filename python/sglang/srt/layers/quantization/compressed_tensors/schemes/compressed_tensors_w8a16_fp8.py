@@ -83,6 +83,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             # Known Marlin mismatch for square RowParallelLinear (e.g., o_proj).
             # Fall back to dequantized matmul for correctness.
             layer.fp8_marlin_fallback = True
+            logger.info_once(
+                "CompressedTensorsW8A16Fp8: enable fp8_marlin_fallback for layer=%s",
+                getattr(layer, "prefix", layer.__class__.__name__),
+            )
         prepare_fp8_layer_for_marlin(
             layer,
             size_k_first=size_k_first,
@@ -154,6 +158,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if getattr(layer, "fp8_marlin_fallback", False):
+            logger.info_once(
+                "CompressedTensorsW8A16Fp8: using fp8_marlin_fallback for layer=%s",
+                getattr(layer, "prefix", layer.__class__.__name__),
+            )
             # Dequantized fallback for correctness on square RowParallelLinear.
             weight = layer.fp8_weight.to(torch.float16)
             scales = layer.fp8_weight_scale.to(torch.float16)
