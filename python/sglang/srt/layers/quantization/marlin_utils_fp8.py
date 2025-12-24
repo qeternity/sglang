@@ -357,6 +357,12 @@ def prepare_fp8_layer_for_marlin(
             err_raw_inv,
             err_no_t,
         )
+        layer.fp8_fallback_transpose = err <= err_no_t
+        logger.info(
+            "Marlin FP8 debug: layer=%s fallback_transpose=%s",
+            layer_name,
+            layer.fp8_fallback_transpose,
+        )
         if err > 0.05:
             logger.warning(
                 "Marlin FP8 debug: layer=%s large error (perm_scale=%s). "

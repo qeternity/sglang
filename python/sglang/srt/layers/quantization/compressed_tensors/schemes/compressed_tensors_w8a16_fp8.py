@@ -167,7 +167,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             weight = layer.fp8_weight.to(torch.float16)
             scales = layer.fp8_weight_scale.to(torch.float16)
             weight = weight * scales
-            out = torch.matmul(x.to(torch.float16), weight.t())
+            x_fp16 = x.to(torch.float16)
+            if getattr(layer, "fp8_fallback_transpose", True):
+                out = torch.matmul(x_fp16, weight.t())
+            else:
+                out = torch.matmul(x_fp16, weight)
             if bias is not None:
                 out = out + bias.to(torch.float16)
             return out.to(x.dtype)
