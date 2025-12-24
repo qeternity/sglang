@@ -223,13 +223,13 @@ def prepare_fp8_layer_for_marlin(
         with torch.no_grad():
             # Compare Marlin output to reference dequantized matmul to validate scale semantics.
             m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
-            x = torch.randn((m, part_size_k), device=device, dtype=torch.float16)
-            weight_fp16 = orig_weight.to(torch.float16)
-            scales_fp16 = scales.to(torch.float16)
-            ref = x @ (weight_fp16 * scales_fp16)
-            ref_inv = x @ (weight_fp16 * (1.0 / scales_fp16))
+            x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
+            weight_fp32 = orig_weight.to(torch.float32)
+            scales_fp32 = scales.to(torch.float32)
+            ref = x @ (weight_fp32 * scales_fp32)
+            ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
             marlin_out = gptq_marlin_gemm(
-                a=x,
+                a=x.to(torch.float16),
                 c=None,
                 b_q_weight=marlin_qweight,
                 b_scales=marlin_scales.to(torch.float16),
@@ -245,6 +245,7 @@ def prepare_fp8_layer_for_marlin(
                 use_atomic_add=False,
                 use_fp32_reduce=False,
             )
+            marlin_out = marlin_out.to(torch.float32)
             err = (marlin_out - ref).abs().max().item()
             err_inv = (marlin_out - ref_inv).abs().max().item()
             logger.info_once(
