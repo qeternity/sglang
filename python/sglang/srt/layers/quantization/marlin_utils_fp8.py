@@ -311,11 +311,14 @@ def prepare_fp8_layer_for_marlin(
             use_atomic_add=False,
             use_fp32_reduce=False,
         )
+        raw_scales_for_marlin = raw_scales
+        if raw_scales_for_marlin.shape[-1] != part_size_n:
+            raw_scales_for_marlin = raw_scales_for_marlin.view(1, part_size_n)
         marlin_out_raw = gptq_marlin_gemm(
             a=x.to(torch.float16),
             c=None,
             b_q_weight=marlin_qweight,
-            b_scales=raw_scales.to(torch.float16),
+            b_scales=raw_scales_for_marlin.to(torch.float16),
             global_scale=None,
             b_zeros=None,
             g_idx=None,
