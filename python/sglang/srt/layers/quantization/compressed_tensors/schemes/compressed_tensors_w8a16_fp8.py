@@ -162,6 +162,28 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             weight = layer.fp8_weight.to(torch.float16)
             scales = layer.fp8_weight_scale.to(torch.float16)
             weight = weight * scales
+            if not hasattr(layer, "fp8_fallback_logged"):
+                layer.fp8_fallback_logged = True
+                layer_name = getattr(layer, "prefix", layer.__class__.__name__)
+                if layer_name == "model.layers.0.mlp.gate_up_proj":
+                    w_fp32 = layer.fp8_weight.to(torch.float32)
+                    s_fp32 = layer.fp8_weight_scale.to(torch.float32)
+                    w_dq = w_fp32 * s_fp32
+                    logger.warning(
+                        "FP8 fallback stats layer=%s w_min=%s w_max=%s w_mean=%s "
+                        "s_min=%s s_max=%s s_mean=%s dq_min=%s dq_max=%s dq_mean=%s dq_norm=%s",
+                        layer_name,
+                        w_fp32.min().item(),
+                        w_fp32.max().item(),
+                        w_fp32.mean().item(),
+                        s_fp32.min().item(),
+                        s_fp32.max().item(),
+                        s_fp32.mean().item(),
+                        w_dq.min().item(),
+                        w_dq.max().item(),
+                        w_dq.mean().item(),
+                        torch.norm(w_dq).item(),
+                    )
             x_fp16 = x.to(torch.float16)
             if getattr(layer, "fp8_fallback_transpose", True):
                 out = torch.matmul(x_fp16, weight.t())
