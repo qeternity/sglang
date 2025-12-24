@@ -74,14 +74,15 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        size_k_first = False
-        transpose_qweight = True
-        # Debug: force fallback for all layers to isolate Marlin issues.
-        layer.fp8_marlin_fallback = True
-        logger.warning(
-            "CompressedTensorsW8A16Fp8: enable fp8_marlin_fallback for layer=%s",
-            getattr(layer, "prefix", layer.__class__.__name__),
+        # Preserve original FP8 tensors for optional fallback.
+        layer.fp8_weight = layer.weight
+        layer.fp8_weight_scale = layer.weight_scale
+        # Match FP8 marlin path used by fp8.py (weight stored as KxN).
+        layer.weight = torch.nn.Parameter(
+            layer.weight.t().contiguous(), requires_grad=False
         )
+        size_k_first = True
+        transpose_qweight = True
         prepare_fp8_layer_for_marlin(
             layer,
             size_k_first=size_k_first,
@@ -158,7 +159,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 getattr(layer, "prefix", layer.__class__.__name__),
             )
             layer.fp8_marlin_fallback_used = True
-            # Dequantized fallback for correctness on square RowParallelLinear.
+            # Dequantized fallback for correctness (matches F.linear).
             weight = layer.fp8_weight.to(torch.float16)
             scales = layer.fp8_weight_scale.to(torch.float16)
             weight = weight * scales
@@ -185,10 +186,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         torch.norm(w_dq).item(),
                     )
             x_fp16 = x.to(torch.float16)
-            if getattr(layer, "fp8_fallback_transpose", True):
-                out = torch.matmul(x_fp16, weight.t())
-            else:
-                out = torch.matmul(x_fp16, weight)
+            out = torch.matmul(x_fp16, weight.t())
             if bias is not None:
                 out = out + bias.to(torch.float16)
             return out.to(x.dtype)

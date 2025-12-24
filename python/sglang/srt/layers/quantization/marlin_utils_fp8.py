@@ -238,9 +238,11 @@ def prepare_fp8_layer_for_marlin(
         num_nan,
     )
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
-    # Preserve raw FP8 weight/scales for optional fallback.
-    layer.fp8_weight = orig_weight
-    layer.fp8_weight_scale = raw_scales
+    # Preserve raw FP8 weight/scales for optional fallback unless already set.
+    if not hasattr(layer, "fp8_weight"):
+        layer.fp8_weight = orig_weight
+    if not hasattr(layer, "fp8_weight_scale"):
+        layer.fp8_weight_scale = raw_scales
 
     if hasattr(layer, "bias") and layer.bias is not None:
         assert layer.bias.shape == (part_size_n,)
