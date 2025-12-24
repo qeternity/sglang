@@ -228,6 +228,8 @@ def prepare_fp8_layer_for_marlin(
         m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
         x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
         weight_fp32 = orig_weight.to(torch.float32)
+        if size_k_first is False:
+            weight_fp32 = weight_fp32.t()
         scales_fp32 = scales.to(torch.float32)
         ref = x @ (weight_fp32 * scales_fp32)
         ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
