@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import Callable, List, Optional
 
 import torch
@@ -22,6 +23,8 @@ from sglang.srt.layers.quantization.utils import convert_to_channelwise
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
+logger = logging.getLogger(__name__)
+
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
 
 
@@ -40,8 +43,18 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
         if self.strategy == QuantizationStrategy.TENSOR:
+            logger.info_once(
+                "CompressedTensorsW8A16Fp8: tensor weight scales shape=%s dtype=%s",
+                tuple(layer.weight_scale.shape),
+                layer.weight_scale.dtype,
+            )
             ws_channelwise = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
+            )
+            logger.info_once(
+                "CompressedTensorsW8A16Fp8: converted channel scales shape=%s dtype=%s",
+                tuple(ws_channelwise.shape),
+                ws_channelwise.dtype,
             )
             layer.weight_scale = torch.nn.Parameter(ws_channelwise, requires_grad=False)
         else:
@@ -49,6 +62,12 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.data, requires_grad=False
             )
+
+        logger.info_once(
+            "CompressedTensorsW8A16Fp8: weight shape=%s dtype=%s",
+            tuple(layer.weight.shape),
+            layer.weight.dtype,
+        )
 
         # Weights must be transposed for marlin
         layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)

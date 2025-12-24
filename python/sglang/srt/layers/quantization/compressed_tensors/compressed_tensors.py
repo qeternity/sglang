@@ -65,6 +65,15 @@ SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
 
 
+def _format_quant_args(q: Optional[QuantizationArgs]) -> str:
+    if q is None:
+        return "None"
+    return (
+        f"type={q.type} bits={q.num_bits} strat={q.strategy} "
+        f"dyn={q.dynamic} sym={q.symmetric}"
+    )
+
+
 class DeviceCapability(NamedTuple):
     major: int
     minor: int
@@ -308,37 +317,56 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _is_static_tensor_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        is_int = (
+            weight_quant.type in (QuantizationType.INT, QuantizationType.INT.value)
+            and input_quant.type in (QuantizationType.INT, QuantizationType.INT.value)
+        )
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy
+            in (
+                QuantizationStrategy.TENSOR,
+                QuantizationStrategy.TENSOR.value,
+                QuantizationStrategy.CHANNEL,
+                QuantizationStrategy.CHANNEL.value,
+            )
         )
-        is_tensor = (
-            weight_strategy
-            and input_quant.strategy == QuantizationStrategy.TENSOR.value
+        is_tensor = weight_strategy and input_quant.strategy in (
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.TENSOR.value,
         )
         is_static = not weight_quant.dynamic and not input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_8_bits and is_tensor and weight_quant.symmetric and is_static
+        return is_int and is_8_bits and is_tensor and weight_quant.symmetric and is_static
 
     def _is_dynamic_token_w8a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
+        is_int = (
+            weight_quant.type in (QuantizationType.INT, QuantizationType.INT.value)
+            and input_quant.type in (QuantizationType.INT, QuantizationType.INT.value)
+        )
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8
         weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            weight_quant.strategy
+            in (
+                QuantizationStrategy.TENSOR,
+                QuantizationStrategy.TENSOR.value,
+                QuantizationStrategy.CHANNEL,
+                QuantizationStrategy.CHANNEL.value,
+            )
         )
-        is_token = (
-            weight_strategy and input_quant.strategy == QuantizationStrategy.TOKEN.value
+        is_token = weight_strategy and input_quant.strategy in (
+            QuantizationStrategy.TOKEN,
+            QuantizationStrategy.TOKEN.value,
         )
         is_dynamic = not weight_quant.dynamic and input_quant.dynamic
 
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
-        return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+        return is_int and is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
     def _is_fp8_w8a8(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
@@ -349,16 +377,19 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Confirm weight scheme is supported.
         is_floating_point = (
-            weight_quant.type == QuantizationType.FLOAT
-            and input_quant.type == QuantizationType.FLOAT
+            weight_quant.type in (QuantizationType.FLOAT, QuantizationType.FLOAT.value)
+            and input_quant.type in (QuantizationType.FLOAT, QuantizationType.FLOAT.value)
         )
         is_symmetric_weight = weight_quant.symmetric
         is_static_weight = not weight_quant.dynamic
-        is_tensor_or_channel_or_block_weight = weight_quant.strategy in [
+        is_tensor_or_channel_or_block_weight = weight_quant.strategy in (
             QuantizationStrategy.TENSOR,
+            QuantizationStrategy.TENSOR.value,
             QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.CHANNEL.value,
             QuantizationStrategy.BLOCK,
-        ]
+            QuantizationStrategy.BLOCK.value,
+        )
         if not (
             is_floating_point
             and is_symmetric_weight
@@ -373,7 +404,10 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Confirm activation scheme is supported.
         is_symmetric_activation = input_quant.symmetric
-        is_per_tensor_activation = input_quant.strategy == QuantizationStrategy.TENSOR
+        is_per_tensor_activation = input_quant.strategy in (
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.TENSOR.value,
+        )
         return is_symmetric_activation and is_per_tensor_activation
 
     def _is_fp8_w8a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
@@ -555,6 +589,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             scheme_dict = self.target_scheme_map[matched_target]
             weight_quant = scheme_dict.get("weights")
             input_quant = scheme_dict.get("input_activations")
+            logger.info_once(
+                "CompressedTensors target=%s format=%s weight=%s input=%s",
+                matched_target,
+                self.quant_format,
+                _format_quant_args(weight_quant),
+                _format_quant_args(input_quant),
+            )
 
         # Find the sparsity scheme of the layer
         # assume that fused layers inerhit first component's sparsity scheme
@@ -595,6 +636,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
+        logger.info_once(
+            "CompressedTensors selected scheme=%s for layer=%s",
+            scheme.__class__.__name__,
+            layer_name,
+        )
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
 

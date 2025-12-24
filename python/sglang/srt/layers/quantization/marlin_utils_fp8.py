@@ -102,6 +102,14 @@ def prepare_fp8_layer_for_marlin(
         assert layer.weight.shape == (part_size_n, part_size_k)
 
     device = layer.weight.device
+    logger.info_once(
+        "Marlin FP8 prep: weight shape=%s dtype=%s part_size_k=%s part_size_n=%s block_size=%s",
+        tuple(layer.weight.shape),
+        layer.weight.dtype,
+        part_size_k,
+        part_size_n,
+        weight_block_size,
+    )
 
     # WORKSPACE
     layer.workspace = marlin_make_workspace(device)
@@ -131,6 +139,21 @@ def prepare_fp8_layer_for_marlin(
         del layer.weight_scale_inv
 
     group_size = -1 if weight_block_size is None else weight_block_size[1]
+    if scales.numel() > 0:
+        scale_min = scales.min().item()
+        scale_max = scales.max().item()
+        scale_mean = scales.mean().item()
+    else:
+        scale_min = scale_max = scale_mean = None
+    logger.info_once(
+        "Marlin FP8 prep: scales shape=%s dtype=%s group_size=%s min=%s max=%s mean=%s",
+        tuple(scales.shape),
+        scales.dtype,
+        group_size,
+        scale_min,
+        scale_max,
+        scale_mean,
+    )
 
     # marlin kernel only support channel-wise and group-wise quantization
     # we need to convert the scales
