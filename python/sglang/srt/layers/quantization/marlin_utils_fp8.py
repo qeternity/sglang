@@ -237,6 +237,8 @@ def prepare_fp8_layer_for_marlin(
             scales_fp32 = scales.to(torch.float32)
             ref = x @ (weight_fp32 * scales_fp32)
             ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
+            ref_scale_448 = x @ (weight_fp32 * (scales_fp32 * 448.0))
+            ref_scale_div_448 = x @ (weight_fp32 * (scales_fp32 / 448.0))
             marlin_out = gptq_marlin_gemm(
                 a=x.to(torch.float16),
                 c=None,
@@ -275,12 +277,17 @@ def prepare_fp8_layer_for_marlin(
             marlin_out_raw = marlin_out_raw.to(torch.float32)
             err = (marlin_out - ref).abs().max().item()
             err_inv = (marlin_out - ref_inv).abs().max().item()
+            err_scale_448 = (marlin_out - ref_scale_448).abs().max().item()
+            err_scale_div_448 = (marlin_out - ref_scale_div_448).abs().max().item()
             err_raw = (marlin_out_raw - ref).abs().max().item()
             err_raw_inv = (marlin_out_raw - ref_inv).abs().max().item()
             logger.info_once(
-                "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s raw_scale=%s raw_inv=%s",
+                "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
+                "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s",
                 err,
                 err_inv,
+                err_scale_448,
+                err_scale_div_448,
                 err_raw,
                 err_raw_inv,
             )
