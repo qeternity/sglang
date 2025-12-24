@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 def fp8_fused_exponent_bias_into_scales(scales):
     # Do not fuse exponent bias into scales for FP8 Marlin on Ampere.
     # This amplification inflates scales (e.g., x256), causing gibberish output.
+    logger.info_once("Marlin FP8: skipping exponent-bias folding for scales")
     return scales
 
 
