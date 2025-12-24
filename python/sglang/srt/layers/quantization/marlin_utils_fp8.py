@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -121,13 +121,8 @@ def prepare_fp8_layer_for_marlin(
     # Repack weights to marlin format
     perm = torch.empty(0, dtype=torch.int, device=device)
     orig_weight = layer.weight
-    pack_k_first = size_k_first
-    flip_pack = get_bool_env_var("SGLANG_FP8_MARLIN_FLIP_PACK")
-    if flip_pack:
-        logger.warning_once("Marlin FP8: flipping pack order")
-        pack_k_first = not pack_k_first
-    qweight = pack_fp8_to_int32(orig_weight, pack_k_first)
-    if not size_k_first and not flip_pack:
+    qweight = pack_fp8_to_int32(orig_weight, size_k_first)
+    if not size_k_first:
         qweight = qweight.T.contiguous()
 
     marlin_qweight = gptq_marlin_repack(
@@ -198,9 +193,6 @@ def prepare_fp8_layer_for_marlin(
     marlin_scales = marlin_permute_scales(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
-    if get_bool_env_var("SGLANG_FP8_MARLIN_NO_SCALE_PERM"):
-        logger.warning_once("Marlin FP8: skipping scale permutation")
-        marlin_scales = raw_scales
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     if marlin_scales.numel() > 0:
         scales_min = marlin_scales.min().item()
@@ -228,69 +220,68 @@ def prepare_fp8_layer_for_marlin(
         bias = marlin_permute_bias(layer.bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
 
-    if get_bool_env_var("SGLANG_FP8_MARLIN_DEBUG"):
-        with torch.no_grad():
-            # Compare Marlin output to reference dequantized matmul to validate scale semantics.
-            m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
-            x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
-            weight_fp32 = orig_weight.to(torch.float32)
-            scales_fp32 = scales.to(torch.float32)
-            ref = x @ (weight_fp32 * scales_fp32)
-            ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
-            ref_scale_448 = x @ (weight_fp32 * (scales_fp32 * 448.0))
-            ref_scale_div_448 = x @ (weight_fp32 * (scales_fp32 / 448.0))
-            marlin_out = gptq_marlin_gemm(
-                a=x.to(torch.float16),
-                c=None,
-                b_q_weight=marlin_qweight,
-                b_scales=marlin_scales.to(torch.float16),
-                global_scale=None,
-                b_zeros=None,
-                g_idx=None,
-                perm=None,
-                workspace=layer.workspace,
-                b_q_type=scalar_types.float8_e4m3fn,
-                size_m=m,
-                size_n=part_size_n,
-                size_k=part_size_k,
-                use_atomic_add=False,
-                use_fp32_reduce=False,
-            )
-            marlin_out_raw = gptq_marlin_gemm(
-                a=x.to(torch.float16),
-                c=None,
-                b_q_weight=marlin_qweight,
-                b_scales=raw_scales.to(torch.float16),
-                global_scale=None,
-                b_zeros=None,
-                g_idx=None,
-                perm=None,
-                workspace=layer.workspace,
-                b_q_type=scalar_types.float8_e4m3fn,
-                size_m=m,
-                size_n=part_size_n,
-                size_k=part_size_k,
-                use_atomic_add=False,
-                use_fp32_reduce=False,
-            )
-            marlin_out = marlin_out.to(torch.float32)
-            marlin_out_raw = marlin_out_raw.to(torch.float32)
-            err = (marlin_out - ref).abs().max().item()
-            err_inv = (marlin_out - ref_inv).abs().max().item()
-            err_scale_448 = (marlin_out - ref_scale_448).abs().max().item()
-            err_scale_div_448 = (marlin_out - ref_scale_div_448).abs().max().item()
-            err_raw = (marlin_out_raw - ref).abs().max().item()
-            err_raw_inv = (marlin_out_raw - ref_inv).abs().max().item()
-            logger.info_once(
-                "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
-                "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s",
-                err,
-                err_inv,
-                err_scale_448,
-                err_scale_div_448,
-                err_raw,
-                err_raw_inv,
-            )
+    with torch.no_grad():
+        # Compare Marlin output to reference dequantized matmul to validate scale semantics.
+        m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
+        x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
+        weight_fp32 = orig_weight.to(torch.float32)
+        scales_fp32 = scales.to(torch.float32)
+        ref = x @ (weight_fp32 * scales_fp32)
+        ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
+        ref_scale_448 = x @ (weight_fp32 * (scales_fp32 * 448.0))
+        ref_scale_div_448 = x @ (weight_fp32 * (scales_fp32 / 448.0))
+        marlin_out = gptq_marlin_gemm(
+            a=x.to(torch.float16),
+            c=None,
+            b_q_weight=marlin_qweight,
+            b_scales=marlin_scales.to(torch.float16),
+            global_scale=None,
+            b_zeros=None,
+            g_idx=None,
+            perm=None,
+            workspace=layer.workspace,
+            b_q_type=scalar_types.float8_e4m3fn,
+            size_m=m,
+            size_n=part_size_n,
+            size_k=part_size_k,
+            use_atomic_add=False,
+            use_fp32_reduce=False,
+        )
+        marlin_out_raw = gptq_marlin_gemm(
+            a=x.to(torch.float16),
+            c=None,
+            b_q_weight=marlin_qweight,
+            b_scales=raw_scales.to(torch.float16),
+            global_scale=None,
+            b_zeros=None,
+            g_idx=None,
+            perm=None,
+            workspace=layer.workspace,
+            b_q_type=scalar_types.float8_e4m3fn,
+            size_m=m,
+            size_n=part_size_n,
+            size_k=part_size_k,
+            use_atomic_add=False,
+            use_fp32_reduce=False,
+        )
+        marlin_out = marlin_out.to(torch.float32)
+        marlin_out_raw = marlin_out_raw.to(torch.float32)
+        err = (marlin_out - ref).abs().max().item()
+        err_inv = (marlin_out - ref_inv).abs().max().item()
+        err_scale_448 = (marlin_out - ref_scale_448).abs().max().item()
+        err_scale_div_448 = (marlin_out - ref_scale_div_448).abs().max().item()
+        err_raw = (marlin_out_raw - ref).abs().max().item()
+        err_raw_inv = (marlin_out_raw - ref_inv).abs().max().item()
+        logger.info_once(
+            "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
+            "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s",
+            err,
+            err_inv,
+            err_scale_448,
+            err_scale_div_448,
+            err_raw,
+            err_raw_inv,
+        )
 
 
 def prepare_moe_fp8_layer_for_marlin(
