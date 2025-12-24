@@ -25,10 +25,22 @@ logger = logging.getLogger(__name__)
 
 
 def fp8_fused_exponent_bias_into_scales(scales):
-    # Do not fuse exponent bias into scales for FP8 Marlin on Ampere.
-    # This amplification inflates scales (e.g., x256), causing gibberish output.
-    logger.info_once("Marlin FP8: skipping exponent-bias folding for scales")
-    return scales
+    # Marlin dequant for FP8 skips exponent-bias correction, so we fold the
+    # FP8->FP16 exponent bias (x256) into scales. Use FP16 bias even when
+    # scales are BF16 to avoid BF16-scale explosion.
+    fp8_exponent = 4
+    target_exponent = 5  # FP16 exponent
+    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
+    if scales.dtype == torch.bfloat16:
+        work_scales = scales.to(torch.float16)
+    elif scales.dtype == torch.float16:
+        work_scales = scales
+    else:
+        return scales
+    s = torch.ones_like(work_scales) * 2
+    s = s**exponent_bias
+    logger.info_once("Marlin FP8: folding exponent-bias into scales (x256)")
+    return (work_scales * s).to(scales.dtype)
 
 
 def apply_fp8_marlin_linear(
@@ -232,10 +244,14 @@ def prepare_fp8_layer_for_marlin(
         w_scaled_inv = weight_fp32 * (1.0 / scales_fp32)
         w_scaled_448 = weight_fp32 * (scales_fp32 * 448.0)
         w_scaled_div_448 = weight_fp32 * (scales_fp32 / 448.0)
+        w_scaled_256 = weight_fp32 * (scales_fp32 * 256.0)
+        w_scaled_div_256 = weight_fp32 * (scales_fp32 / 256.0)
         w_scaled_t = w_scaled.t()
         w_scaled_inv_t = w_scaled_inv.t()
         w_scaled_448_t = w_scaled_448.t()
         w_scaled_div_448_t = w_scaled_div_448.t()
+        w_scaled_256_t = w_scaled_256.t()
+        w_scaled_div_256_t = w_scaled_div_256.t()
         ref_t = x @ w_scaled_t if x.shape[1] == w_scaled_t.shape[0] else x @ w_scaled
         ref_t_inv = (
             x @ w_scaled_inv_t
@@ -251,6 +267,16 @@ def prepare_fp8_layer_for_marlin(
             x @ w_scaled_div_448_t
             if x.shape[1] == w_scaled_div_448_t.shape[0]
             else x @ w_scaled_div_448
+        )
+        ref_t_256 = (
+            x @ w_scaled_256_t
+            if x.shape[1] == w_scaled_256_t.shape[0]
+            else x @ w_scaled_256
+        )
+        ref_t_div_256 = (
+            x @ w_scaled_div_256_t
+            if x.shape[1] == w_scaled_div_256_t.shape[0]
+            else x @ w_scaled_div_256
         )
         ref_no_t = x @ w_scaled if x.shape[1] == w_scaled.shape[0] else x @ w_scaled_t
         marlin_out = gptq_marlin_gemm(
@@ -293,16 +319,21 @@ def prepare_fp8_layer_for_marlin(
         err_inv = (marlin_out - ref_t_inv).abs().max().item()
         err_scale_448 = (marlin_out - ref_t_448).abs().max().item()
         err_scale_div_448 = (marlin_out - ref_t_div_448).abs().max().item()
+        err_scale_256 = (marlin_out - ref_t_256).abs().max().item()
+        err_scale_div_256 = (marlin_out - ref_t_div_256).abs().max().item()
         err_raw = (marlin_out_raw - ref_t).abs().max().item()
         err_raw_inv = (marlin_out_raw - ref_t_inv).abs().max().item()
         err_no_t = (marlin_out - ref_no_t).abs().max().item()
         logger.info_once(
             "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
-            "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s no_t=%s",
+            "perm_scale*448=%s perm_scale/448=%s perm_scale*256=%s "
+            "perm_scale/256=%s raw_scale=%s raw_inv=%s no_t=%s",
             err,
             err_inv,
             err_scale_448,
             err_scale_div_448,
+            err_scale_256,
+            err_scale_div_256,
             err_raw,
             err_raw_inv,
             err_no_t,
