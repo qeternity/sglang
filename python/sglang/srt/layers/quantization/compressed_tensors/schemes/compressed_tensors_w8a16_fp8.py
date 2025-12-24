@@ -80,9 +80,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.__class__.__name__ == "RowParallelLinear"
             and layer.input_size_per_partition == layer.output_size_per_partition
         ):
-            # For square row-parallel layers, avoid the extra transpose so the
-            # Marlin output matches F.linear's weight orientation.
-            transpose_qweight = False
+            # Known Marlin mismatch for square RowParallelLinear (e.g., o_proj).
+            # Fall back to dequantized matmul for correctness.
+            layer.fp8_marlin_fallback = True
         prepare_fp8_layer_for_marlin(
             layer,
             size_k_first=size_k_first,
@@ -153,6 +153,15 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(layer, "fp8_marlin_fallback", False):
+            # Dequantized fallback for correctness on square RowParallelLinear.
+            weight = layer.fp8_weight.to(torch.float16)
+            scales = layer.fp8_weight_scale.to(torch.float16)
+            weight = weight * scales
+            out = torch.matmul(x.to(torch.float16), weight.t())
+            if bias is not None:
+                out = out + bias.to(torch.float16)
+            return out.to(x.dtype)
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
