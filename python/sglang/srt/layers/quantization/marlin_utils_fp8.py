@@ -180,6 +180,9 @@ def prepare_fp8_layer_for_marlin(
         scale_mean,
     )
 
+    # Preserve the raw channel-wise scales for fallback dequantization.
+    raw_scales = scales
+
     # marlin kernel only support channel-wise and group-wise quantization
     # we need to convert the scales
     if weight_block_size is None:
@@ -210,7 +213,6 @@ def prepare_fp8_layer_for_marlin(
         # size_n may not divisible by block_size[0]
         scales = scales[:, :part_size_n]
 
-    raw_scales = scales
     marlin_scales = marlin_permute_scales(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
