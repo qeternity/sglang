@@ -228,13 +228,16 @@ def prepare_fp8_layer_for_marlin(
         m = int(getattr(layer, "fp8_marlin_debug_m", 1) or 1)
         x = torch.randn((m, part_size_k), device=device, dtype=torch.float32)
         weight_fp32 = orig_weight.to(torch.float32)
-        if size_k_first is False:
-            weight_fp32 = weight_fp32.t()
         scales_fp32 = scales.to(torch.float32)
-        ref = x @ (weight_fp32 * scales_fp32)
-        ref_inv = x @ (weight_fp32 * (1.0 / scales_fp32))
-        ref_scale_448 = x @ (weight_fp32 * (scales_fp32 * 448.0))
-        ref_scale_div_448 = x @ (weight_fp32 * (scales_fp32 / 448.0))
+        w_scaled = weight_fp32 * scales_fp32
+        w_scaled_inv = weight_fp32 * (1.0 / scales_fp32)
+        w_scaled_448 = weight_fp32 * (scales_fp32 * 448.0)
+        w_scaled_div_448 = weight_fp32 * (scales_fp32 / 448.0)
+        ref_t = x @ w_scaled.t()
+        ref_t_inv = x @ w_scaled_inv.t()
+        ref_t_448 = x @ w_scaled_448.t()
+        ref_t_div_448 = x @ w_scaled_div_448.t()
+        ref_no_t = x @ w_scaled
         marlin_out = gptq_marlin_gemm(
             a=x.to(torch.float16),
             c=None,
@@ -271,21 +274,23 @@ def prepare_fp8_layer_for_marlin(
         )
         marlin_out = marlin_out.to(torch.float32)
         marlin_out_raw = marlin_out_raw.to(torch.float32)
-        err = (marlin_out - ref).abs().max().item()
-        err_inv = (marlin_out - ref_inv).abs().max().item()
-        err_scale_448 = (marlin_out - ref_scale_448).abs().max().item()
-        err_scale_div_448 = (marlin_out - ref_scale_div_448).abs().max().item()
-        err_raw = (marlin_out_raw - ref).abs().max().item()
-        err_raw_inv = (marlin_out_raw - ref_inv).abs().max().item()
+        err = (marlin_out - ref_t).abs().max().item()
+        err_inv = (marlin_out - ref_t_inv).abs().max().item()
+        err_scale_448 = (marlin_out - ref_t_448).abs().max().item()
+        err_scale_div_448 = (marlin_out - ref_t_div_448).abs().max().item()
+        err_raw = (marlin_out_raw - ref_t).abs().max().item()
+        err_raw_inv = (marlin_out_raw - ref_t_inv).abs().max().item()
+        err_no_t = (marlin_out - ref_no_t).abs().max().item()
         logger.info_once(
             "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s "
-            "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s",
+            "perm_scale*448=%s perm_scale/448=%s raw_scale=%s raw_inv=%s no_t=%s",
             err,
             err_inv,
             err_scale_448,
             err_scale_div_448,
             err_raw,
             err_raw_inv,
+            err_no_t,
         )
 
 
