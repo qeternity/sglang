@@ -121,7 +121,11 @@ def prepare_fp8_layer_for_marlin(
     # Repack weights to marlin format
     perm = torch.empty(0, dtype=torch.int, device=device)
     orig_weight = layer.weight
-    qweight = pack_fp8_to_int32(orig_weight, size_k_first)
+    pack_k_first = size_k_first
+    if get_bool_env_var("SGLANG_FP8_MARLIN_FLIP_PACK"):
+        logger.warning_once("Marlin FP8: flipping pack order")
+        pack_k_first = not pack_k_first
+    qweight = pack_fp8_to_int32(orig_weight, pack_k_first)
     if not size_k_first:
         qweight = qweight.T.contiguous()
 
