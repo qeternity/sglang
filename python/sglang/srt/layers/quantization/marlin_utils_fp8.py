@@ -189,9 +189,13 @@ def prepare_fp8_layer_for_marlin(
         # size_n may not divisible by block_size[0]
         scales = scales[:, :part_size_n]
 
+    raw_scales = scales
     marlin_scales = marlin_permute_scales(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
+    if get_bool_env_var("SGLANG_FP8_MARLIN_NO_SCALE_PERM"):
+        logger.warning_once("Marlin FP8: skipping scale permutation")
+        marlin_scales = raw_scales
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
     if marlin_scales.numel() > 0:
         scales_min = marlin_scales.min().item()
@@ -245,13 +249,35 @@ def prepare_fp8_layer_for_marlin(
                 use_atomic_add=False,
                 use_fp32_reduce=False,
             )
+            marlin_out_raw = gptq_marlin_gemm(
+                a=x.to(torch.float16),
+                c=None,
+                b_q_weight=marlin_qweight,
+                b_scales=raw_scales.to(torch.float16),
+                global_scale=None,
+                b_zeros=None,
+                g_idx=None,
+                perm=None,
+                workspace=layer.workspace,
+                b_q_type=scalar_types.float8_e4m3fn,
+                size_m=m,
+                size_n=part_size_n,
+                size_k=part_size_k,
+                use_atomic_add=False,
+                use_fp32_reduce=False,
+            )
             marlin_out = marlin_out.to(torch.float32)
+            marlin_out_raw = marlin_out_raw.to(torch.float32)
             err = (marlin_out - ref).abs().max().item()
             err_inv = (marlin_out - ref_inv).abs().max().item()
+            err_raw = (marlin_out_raw - ref).abs().max().item()
+            err_raw_inv = (marlin_out_raw - ref_inv).abs().max().item()
             logger.info_once(
-                "Marlin FP8 debug: max_abs_err scale=%s inv_scale=%s",
+                "Marlin FP8 debug: max_abs_err perm_scale=%s perm_inv=%s raw_scale=%s raw_inv=%s",
                 err,
                 err_inv,
+                err_raw,
+                err_raw_inv,
             )
 
 
