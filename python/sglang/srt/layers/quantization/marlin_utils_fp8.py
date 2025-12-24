@@ -189,6 +189,25 @@ def prepare_fp8_layer_for_marlin(
         s=scales, size_k=part_size_k, size_n=part_size_n, group_size=group_size
     )
     marlin_scales = fp8_fused_exponent_bias_into_scales(marlin_scales)
+    if marlin_scales.numel() > 0:
+        scales_min = marlin_scales.min().item()
+        scales_max = marlin_scales.max().item()
+        scales_mean = marlin_scales.mean().item()
+        num_inf = torch.isinf(marlin_scales).sum().item()
+        num_nan = torch.isnan(marlin_scales).sum().item()
+    else:
+        scales_min = scales_max = scales_mean = None
+        num_inf = num_nan = 0
+    logger.info_once(
+        "Marlin FP8 prep: fused scales shape=%s dtype=%s min=%s max=%s mean=%s inf=%s nan=%s",
+        tuple(marlin_scales.shape),
+        marlin_scales.dtype,
+        scales_min,
+        scales_max,
+        scales_mean,
+        num_inf,
+        num_nan,
+    )
     layer.weight_scale = torch.nn.Parameter(marlin_scales, requires_grad=False)
 
     if hasattr(layer, "bias") and layer.bias is not None:
