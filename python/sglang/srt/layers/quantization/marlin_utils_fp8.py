@@ -25,22 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 def fp8_fused_exponent_bias_into_scales(scales):
-    fp8_exponent = 4
-    if scales.dtype == torch.half:
-        target_exponent = 5
-        work_scales = scales
-    elif scales.dtype == torch.bfloat16:
-        # Use fp16 exponent bias to avoid bf16-scale explosion, then cast back.
-        target_exponent = 5
-        work_scales = scales.to(torch.float16)
-    else:
-        return scales
-    # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
-    # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
-    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
-    s = torch.ones_like(work_scales) * 2
-    s = s**exponent_bias
-    return (work_scales * s).to(scales.dtype)
+    # Do not fuse exponent bias into scales for FP8 Marlin on Ampere.
+    # This amplification inflates scales (e.g., x256), causing gibberish output.
+    return scales
 
 
 def apply_fp8_marlin_linear(
