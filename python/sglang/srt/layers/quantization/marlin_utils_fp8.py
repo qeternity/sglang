@@ -13,7 +13,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     should_use_atomic_add_reduce,
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
