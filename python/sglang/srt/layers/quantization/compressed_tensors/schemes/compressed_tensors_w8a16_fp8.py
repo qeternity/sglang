@@ -58,7 +58,17 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer, size_k_first=True)
+        # Detect weight shape to determine size_k_first parameter
+        # This fixes an issue where Qwen2.5 models have different weight layouts
+        # compared to Qwen3 models in compressed-tensors format
+        part_size_n = layer.output_size_per_partition
+        part_size_k = layer.input_size_per_partition
+        weight_shape = layer.weight.shape
+        # Determine size_k_first based on actual weight shape after transposition
+        # If shape is (part_size_k, part_size_n), then size_k_first=True
+        # If shape is (part_size_n, part_size_k), then size_k_first=False
+        size_k_first = weight_shape == (part_size_k, part_size_n)
+        prepare_fp8_layer_for_marlin(layer, size_k_first=size_k_first)
 
     def create_weights(
         self,
