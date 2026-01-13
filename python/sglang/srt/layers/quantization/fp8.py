@@ -569,12 +569,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
-            if self.use_marlin:
-                log_info_on_rank0(
-                    logger,
-                    "FP8 MoE: Using Marlin kernel for weight-only FP8 quantization "
-                    f"(block_quant={self.block_quant})",
-                )
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
@@ -840,10 +834,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         prepare_moe_fp8_layer_for_marlin,
                     )
 
-                    log_info_on_rank0(
-                        logger,
-                        "FP8 MoE: Preparing block-quantized weights for Marlin kernel",
-                    )
                     layer.weight_block_size = self.quant_config.weight_block_size
                     # Prepare weights and scales for Marlin format
                     prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
@@ -1187,15 +1177,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
                 fused_marlin_moe,
             )
-
-            # Verify that weights were prepared for Marlin
-            if not hasattr(layer, "w13_weight_scale"):
-                raise RuntimeError(
-                    "FP8 MoE Marlin weights not prepared. "
-                    "This may indicate a model loading issue. "
-                    f"Available attributes: w13_weight_scale_inv={hasattr(layer, 'w13_weight_scale_inv')}, "
-                    f"block_quant={self.block_quant}, use_marlin={self.use_marlin}"
-                )
 
             topk_weights, topk_ids, router_logits = dispatch_output.topk_output
             output = fused_marlin_moe(
