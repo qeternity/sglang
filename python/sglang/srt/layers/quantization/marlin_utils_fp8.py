@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import gc
 import logging
 from typing import Optional
 
@@ -196,8 +195,7 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WEIGHT
     # Repack weights to marlin format
-    # Strategy: process expert-by-expert, store results on CPU, then copy back
-    # after deleting original. This keeps peak GPU memory at ~1x.
+    # Strategy: copy to CPU, free GPU, repack, copy back.
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
         if "w13" in name:
@@ -210,7 +208,13 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
-        # Accumulate results on CPU (pinned for fast transfer)
+        # Copy to CPU
+        weight_cpu = weight.cpu()
+
+        # Free GPU memory by resizing to empty
+        weight.data.resize_(0)
+
+        # Repack, processing one expert at a time through GPU
         output_cpu = torch.empty(
             (e, size_k // 16, size_n * 4),
             device="cpu",
@@ -218,9 +222,10 @@ def prepare_moe_fp8_layer_for_marlin(
             pin_memory=True,
         )
 
-        # Process each expert, keeping original on GPU, storing results on CPU
         for i in range(e):
-            qweight = pack_fp8_to_int32(weight[i], size_k_first)
+            expert_gpu = weight_cpu[i].to(device)
+            qweight = pack_fp8_to_int32(expert_gpu, size_k_first)
+            del expert_gpu
             if not size_k_first:
                 qweight = qweight.T.contiguous()
             marlin_qweight = gptq_marlin_repack(
@@ -229,26 +234,11 @@ def prepare_moe_fp8_layer_for_marlin(
             output_cpu[i].copy_(marlin_qweight)
             del qweight, marlin_qweight
 
-        # Delete original to free GPU memory
-        delattr(layer, name)
-        del weight
-        gc.collect()
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        del weight_cpu
 
-        # Now allocate output on GPU and copy from CPU in chunks
-        output = torch.empty(
-            (e, size_k // 16, size_n * 4),
-            device=device,
-            dtype=torch.int32,
-        )
-        chunk_size = max(1, e // 4)
-        for start in range(0, e, chunk_size):
-            end = min(start + chunk_size, e)
-            output[start:end].copy_(output_cpu[start:end])
-
+        # Copy result back to GPU
+        setattr(layer, name, torch.nn.Parameter(output_cpu.to(device), requires_grad=False))
         del output_cpu
-        setattr(layer, name, torch.nn.Parameter(output, requires_grad=False))
 
     # WEIGHT SCALES
     # Permute scales
