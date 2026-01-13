@@ -196,7 +196,8 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WEIGHT
     # Repack weights to marlin format
-    # Process experts in chunks to reduce peak GPU memory from 2x to ~1.25x
+    # Strategy: process expert-by-expert, store results on CPU, then copy back
+    # after deleting original. This keeps peak GPU memory at ~1x.
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
         if "w13" in name:
@@ -209,51 +210,44 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
-        # Process in chunks to limit peak memory
-        # Chunk size of e//4 means peak memory is ~1.25x instead of 2x
-        chunk_size = max(1, e // 4)
-        output_chunks = []
+        # Accumulate results on CPU (pinned for fast transfer)
+        output_cpu = torch.empty(
+            (e, size_k // 16, size_n * 4),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=True,
+        )
 
-        for chunk_start in range(0, e, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, e)
-
-            # Clone this chunk of experts (only ~1/4 of total weight)
-            chunk_weight = weight[chunk_start:chunk_end].clone()
-
-            # If this is the last chunk, delete the original to free memory
-            if chunk_end == e:
-                delattr(layer, name)
-                del weight
-                gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-
-            # Pre-allocate output for this chunk on GPU
-            num_experts_in_chunk = chunk_end - chunk_start
-            chunk_output = torch.empty(
-                (num_experts_in_chunk, size_k // 16, size_n * 4),
-                device=device,
-                dtype=torch.int32,
+        # Process each expert, keeping original on GPU, storing results on CPU
+        for i in range(e):
+            qweight = pack_fp8_to_int32(weight[i], size_k_first)
+            if not size_k_first:
+                qweight = qweight.T.contiguous()
+            marlin_qweight = gptq_marlin_repack(
+                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
+            output_cpu[i].copy_(marlin_qweight)
+            del qweight, marlin_qweight
 
-            # Process each expert in this chunk
-            for i in range(num_experts_in_chunk):
-                qweight = pack_fp8_to_int32(chunk_weight[i], size_k_first)
-                if not size_k_first:
-                    qweight = qweight.T.contiguous()
-                chunk_output[i] = gptq_marlin_repack(
-                    b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
-                )
-                del qweight
+        # Delete original to free GPU memory
+        delattr(layer, name)
+        del weight
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
-            output_chunks.append(chunk_output)
-            del chunk_weight
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Now allocate output on GPU and copy from CPU in chunks
+        output = torch.empty(
+            (e, size_k // 16, size_n * 4),
+            device=device,
+            dtype=torch.int32,
+        )
+        chunk_size = max(1, e // 4)
+        for start in range(0, e, chunk_size):
+            end = min(start + chunk_size, e)
+            output[start:end].copy_(output_cpu[start:end])
 
-        # Concatenate all chunks
-        output = torch.cat(output_chunks, dim=0)
-        del output_chunks
+        del output_cpu
         setattr(layer, name, torch.nn.Parameter(output, requires_grad=False))
 
     # WEIGHT SCALES
