@@ -11,9 +11,11 @@ if _is_cuda:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 
 
-def get_scalar_type(num_bits: int, has_zp: bool):
+def get_scalar_type(num_bits: int, has_zp: bool, use_fp8: bool = False):
     from sgl_kernel.scalar_type import scalar_types
 
+    if use_fp8:
+        return scalar_types.float8_e4m3fn
     if has_zp:
         assert num_bits == 4
         return scalar_types.uint4
@@ -44,6 +46,7 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    use_fp8: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -119,8 +122,8 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None)
+    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None, use_fp8=use_fp8)
+    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None, use_fp8=use_fp8)
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),

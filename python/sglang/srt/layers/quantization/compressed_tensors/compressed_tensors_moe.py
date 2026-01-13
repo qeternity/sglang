@@ -26,8 +26,12 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
+    can_auto_enable_marlin_fp8,
     is_blackwell_supported,
     normalize_e4m3fn_to_e4m3fnuz,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    prepare_moe_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
@@ -541,6 +545,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 "channelwise, dynamic per token quantization."
             )
 
+        # For GPUs that lack FP8 hardware support (e.g. Ampere), we can leverage
+        # the Marlin kernel for fast weight-only FP8 quantization
+        self.use_marlin = False
+        if _is_cuda:
+            from sglang.srt.utils import get_bool_env_var
+
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -774,6 +788,19 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
+        # For GPUs without native FP8 support, prepare weights for Marlin kernel
+        if self.use_marlin:
+            # Store original dtype for Marlin scale conversion
+            layer.orig_dtype = layer.w13_weight_scale.dtype
+            layer.weight_block_size = self.weight_block_size
+            # Prepare weights and scales for Marlin format
+            prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+            # Activations are not quantized for Marlin
+            if hasattr(layer, "w13_input_scale"):
+                del layer.w13_input_scale
+            if hasattr(layer, "w2_input_scale"):
+                del layer.w2_input_scale
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -792,6 +819,27 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
+
+        # Use Marlin kernel for GPUs without native FP8 support (e.g. Ampere)
+        if self.use_marlin:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                fused_marlin_moe,
+            )
+
+            topk_weights, topk_ids, router_logits = topk_output
+            output = fused_marlin_moe(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                gating_output=router_logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                use_fp8=True,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
             assert not moe_runner_config.no_combine, "unsupported"

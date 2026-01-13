@@ -562,6 +562,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
 
+        # For GPUs that lack FP8 hardware support (e.g. Ampere), we can leverage
+        # the Marlin kernel for fast weight-only FP8 quantization
+        self.use_marlin = False
+        if _is_cuda:
+            force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
+            auto_enable = can_auto_enable_marlin_fp8()
+            self.use_marlin = force_marlin or auto_enable
+
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
@@ -877,6 +885,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
+
+            # For GPUs without native FP8 support, prepare weights for Marlin kernel
+            if self.use_marlin:
+                from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+                    prepare_moe_fp8_layer_for_marlin,
+                )
+
+                # Store original dtype for Marlin scale conversion
+                layer.orig_dtype = layer.w13_weight_scale.dtype
+                layer.weight_block_size = None  # Per-tensor quantization
+                # Prepare weights and scales for Marlin format
+                prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+                # Activations are not quantized for Marlin
+                if hasattr(layer, "w13_input_scale"):
+                    del layer.w13_input_scale
+                if hasattr(layer, "w2_input_scale"):
+                    del layer.w2_input_scale
             return
 
         # If checkpoint is fp8, we need to handle that the
@@ -968,6 +993,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 align_fp8_moe_weights_for_flashinfer_trtllm(layer)
+
+            # For GPUs without native FP8 support, prepare weights for Marlin kernel
+            if self.use_marlin:
+                from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+                    prepare_moe_fp8_layer_for_marlin,
+                )
+
+                # Store original dtype for Marlin scale conversion
+                layer.orig_dtype = layer.w13_weight_scale.dtype
+                layer.weight_block_size = None  # Per-tensor quantization
+                # Prepare weights and scales for Marlin format
+                prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+                # Activations are not quantized for Marlin
+                if hasattr(layer, "w13_input_scale"):
+                    del layer.w13_input_scale
+                if hasattr(layer, "w2_input_scale"):
+                    del layer.w2_input_scale
             return
 
     def process_weights_hip_int4(self, layer: Module):
@@ -1114,6 +1156,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
+
+        # Use Marlin kernel for GPUs without native FP8 support (e.g. Ampere)
+        if self.use_marlin:
+            from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+                fused_marlin_moe,
+            )
+
+            topk_weights, topk_ids, router_logits = dispatch_output.topk_output
+            output = fused_marlin_moe(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                gating_output=router_logits,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                use_fp8=True,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
