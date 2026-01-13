@@ -195,7 +195,7 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WEIGHT
     # Repack weights to marlin format
-    # Use pre-allocated output to avoid OOM from list accumulation + concat
+    # Process one expert at a time to minimize GPU memory usage
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
         if "w13" in name:
@@ -208,29 +208,40 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
-        # Pre-allocate output tensor to avoid memory spike from list + concat
-        output = torch.empty(
-            (e, size_k // 16, size_n * 4),  # Marlin FP8 output shape
-            device=device,
-            dtype=torch.int32,
-        )
-
-        for i in range(e):
-            qweight = pack_fp8_to_int32(weight[i], size_k_first)
-            if not size_k_first:
-                qweight = qweight.T.contiguous()
-
-            output[i] = gptq_marlin_repack(
-                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
-            )
-            del qweight  # Free intermediate tensor
-
-        # Explicitly free original weight before creating new Parameter
+        # Move weight to CPU to free GPU memory for repacking
+        weight_cpu = weight.cpu()
         delattr(layer, name)
         del weight
         torch.cuda.empty_cache()
 
-        setattr(layer, name, torch.nn.Parameter(output, requires_grad=False))
+        # Pre-allocate output on CPU to avoid GPU memory pressure
+        output_cpu = torch.empty(
+            (e, size_k // 16, size_n * 4),  # Marlin FP8 output shape
+            device="cpu",
+            dtype=torch.int32,
+        )
+
+        for i in range(e):
+            # Move single expert to GPU, process, move result to CPU
+            expert_weight = weight_cpu[i].to(device)
+            qweight = pack_fp8_to_int32(expert_weight, size_k_first)
+            del expert_weight
+            if not size_k_first:
+                qweight = qweight.T.contiguous()
+
+            marlin_qweight = gptq_marlin_repack(
+                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
+            )
+            output_cpu[i] = marlin_qweight.cpu()
+            del qweight, marlin_qweight
+            torch.cuda.empty_cache()
+
+        del weight_cpu
+
+        # Move repacked weight back to GPU
+        setattr(layer, name, torch.nn.Parameter(output_cpu.to(device), requires_grad=False))
+        del output_cpu
+        torch.cuda.empty_cache()
 
     # WEIGHT SCALES
     # Permute scales
