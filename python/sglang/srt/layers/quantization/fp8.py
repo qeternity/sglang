@@ -602,6 +602,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # Store original dtype for Marlin scale conversion (before params_dtype is modified)
+        layer.orig_dtype = params_dtype
+
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
@@ -841,8 +844,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         logger,
                         "FP8 MoE: Preparing block-quantized weights for Marlin kernel",
                     )
-                    # Store original dtype for Marlin scale conversion
-                    layer.orig_dtype = layer.w13_weight_scale_inv.dtype
                     layer.weight_block_size = self.quant_config.weight_block_size
                     # Prepare weights and scales for Marlin format
                     prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
@@ -920,8 +921,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     prepare_moe_fp8_layer_for_marlin,
                 )
 
-                # Store original dtype for Marlin scale conversion
-                layer.orig_dtype = layer.w13_weight_scale.dtype
                 layer.weight_block_size = None  # Per-tensor quantization
                 # Prepare weights and scales for Marlin format
                 prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
@@ -1028,8 +1027,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     prepare_moe_fp8_layer_for_marlin,
                 )
 
-                # Store original dtype for Marlin scale conversion
-                layer.orig_dtype = layer.w13_weight_scale.dtype
                 layer.weight_block_size = None  # Per-tensor quantization
                 # Prepare weights and scales for Marlin format
                 prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)

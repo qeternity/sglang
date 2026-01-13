@@ -566,6 +566,9 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        # Store original dtype for Marlin scale conversion (before params_dtype is modified)
+        layer.orig_dtype = params_dtype
+
         params_dtype = torch.float8_e4m3fn
 
         if self.block_quant:
@@ -790,8 +793,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         # For GPUs without native FP8 support, prepare weights for Marlin kernel
         if self.use_marlin:
-            # Store original dtype for Marlin scale conversion
-            layer.orig_dtype = layer.w13_weight_scale.dtype
             layer.weight_block_size = self.weight_block_size
             # Prepare weights and scales for Marlin format
             prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
