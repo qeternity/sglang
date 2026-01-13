@@ -569,6 +569,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
+            if self.use_marlin:
+                log_info_on_rank0(
+                    logger,
+                    "FP8 MoE: Using Marlin kernel for weight-only FP8 quantization "
+                    f"(block_quant={self.block_quant})",
+                )
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
@@ -825,6 +831,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             else:
+                # For GPUs without native FP8 support, prepare weights for Marlin kernel
+                if self.use_marlin:
+                    from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+                        prepare_moe_fp8_layer_for_marlin,
+                    )
+
+                    log_info_on_rank0(
+                        logger,
+                        "FP8 MoE: Preparing block-quantized weights for Marlin kernel",
+                    )
+                    # Store original dtype for Marlin scale conversion
+                    layer.orig_dtype = layer.w13_weight_scale_inv.dtype
+                    layer.weight_block_size = self.quant_config.weight_block_size
+                    # Prepare weights and scales for Marlin format
+                    prepare_moe_fp8_layer_for_marlin(layer, size_k_first=False)
+                    # Activations are not quantized for Marlin
+                    if hasattr(layer, "w13_input_scale"):
+                        del layer.w13_input_scale
+                    if hasattr(layer, "w2_input_scale"):
+                        del layer.w2_input_scale
+                    return
+
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
                 from sglang.srt.model_loader.utils import (
@@ -1162,6 +1190,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
                 fused_marlin_moe,
             )
+
+            # Verify that weights were prepared for Marlin
+            if not hasattr(layer, "w13_weight_scale"):
+                raise RuntimeError(
+                    "FP8 MoE Marlin weights not prepared. "
+                    "This may indicate a model loading issue. "
+                    f"Available attributes: w13_weight_scale_inv={hasattr(layer, 'w13_weight_scale_inv')}, "
+                    f"block_quant={self.block_quant}, use_marlin={self.use_marlin}"
+                )
 
             topk_weights, topk_ids, router_logits = dispatch_output.topk_output
             output = fused_marlin_moe(
