@@ -195,7 +195,8 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WEIGHT
     # Repack weights to marlin format
-    # Process one expert at a time to minimize GPU memory usage
+    # Process expert-by-expert: keep original on GPU, accumulate results on CPU,
+    # then swap at the end. Peak GPU memory = original + 1 expert's temporaries.
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
         if "w13" in name:
@@ -208,40 +209,33 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
-        # Move weight to CPU to free GPU memory for repacking
-        weight_cpu = weight.cpu()
-        delattr(layer, name)
-        del weight
-        torch.cuda.empty_cache()
-
-        # Pre-allocate output on CPU to avoid GPU memory pressure
+        # Pre-allocate output on CPU - results accumulate here
         output_cpu = torch.empty(
             (e, size_k // 16, size_n * 4),  # Marlin FP8 output shape
             device="cpu",
             dtype=torch.int32,
+            pin_memory=True,  # Faster GPU->CPU transfer
         )
 
         for i in range(e):
-            # Move single expert to GPU, process, move result to CPU
-            expert_weight = weight_cpu[i].to(device)
-            qweight = pack_fp8_to_int32(expert_weight, size_k_first)
-            del expert_weight
+            # weight[i] is a view into original tensor (no copy)
+            qweight = pack_fp8_to_int32(weight[i], size_k_first)
             if not size_k_first:
                 qweight = qweight.T.contiguous()
 
             marlin_qweight = gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
-            output_cpu[i] = marlin_qweight.cpu()
+            output_cpu[i].copy_(marlin_qweight)  # GPU->CPU (pinned = fast)
             del qweight, marlin_qweight
-            torch.cuda.empty_cache()
 
-        del weight_cpu
+        # Now swap: delete original, move result to GPU
+        delattr(layer, name)
+        del weight
+        torch.cuda.empty_cache()
 
-        # Move repacked weight back to GPU
         setattr(layer, name, torch.nn.Parameter(output_cpu.to(device), requires_grad=False))
         del output_cpu
-        torch.cuda.empty_cache()
 
     # WEIGHT SCALES
     # Permute scales
