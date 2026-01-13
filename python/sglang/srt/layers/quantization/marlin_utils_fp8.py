@@ -29,6 +29,11 @@ def fp8_fused_exponent_bias_into_scales(scales):
         target_exponent = 5
     elif scales.dtype == torch.bfloat16:
         target_exponent = 8
+    elif scales.dtype == torch.float32:
+        target_exponent = 8  # float32 has 8-bit exponent like bfloat16
+    else:
+        raise ValueError(f"Unsupported dtype for Marlin FP8 scales: {scales.dtype}")
+
     # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
     # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
     exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
