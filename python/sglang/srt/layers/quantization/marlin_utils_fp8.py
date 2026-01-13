@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import logging
 from typing import Optional
 
@@ -232,6 +233,8 @@ def prepare_moe_fp8_layer_for_marlin(
         # Now swap: delete original, move result to GPU
         delattr(layer, name)
         del weight
+        gc.collect()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
         setattr(layer, name, torch.nn.Parameter(output_cpu.to(device), requires_grad=False))
