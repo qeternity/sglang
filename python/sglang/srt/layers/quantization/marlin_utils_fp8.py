@@ -195,9 +195,9 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WEIGHT
     # Repack weights to marlin format
+    # Use pre-allocated output to avoid OOM from list accumulation + concat
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
-        tensor_list = []
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
@@ -208,20 +208,29 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
+        # Pre-allocate output tensor to avoid memory spike from list + concat
+        output = torch.empty(
+            (e, size_k // 16, size_n * 4),  # Marlin FP8 output shape
+            device=device,
+            dtype=torch.int32,
+        )
+
         for i in range(e):
             qweight = pack_fp8_to_int32(weight[i], size_k_first)
             if not size_k_first:
                 qweight = qweight.T.contiguous()
 
-            marlin_qweight = gptq_marlin_repack(
+            output[i] = gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
-            tensor_list.append(marlin_qweight)
+            del qweight  # Free intermediate tensor
 
-        weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
-        weight = torch.nn.Parameter(weight, requires_grad=False)
+        # Explicitly free original weight before creating new Parameter
+        delattr(layer, name)
+        del weight
+        torch.cuda.empty_cache()
 
-        setattr(layer, name, weight)
+        setattr(layer, name, torch.nn.Parameter(output, requires_grad=False))
 
     # WEIGHT SCALES
     # Permute scales
