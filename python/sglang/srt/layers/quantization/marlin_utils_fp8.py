@@ -190,14 +190,18 @@ def prepare_moe_fp8_layer_for_marlin(
 
     # WORKSPACE
     device = layer.w13_weight.device
-    layer.workspace = marlin_make_workspace(device, 4)
-    perm = torch.empty(0, dtype=torch.int, device=device)
+    # If weights are on CPU, use current CUDA device for kernels but keep results on CPU
+    is_cpu = device.type == "cpu"
+    cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}") if is_cpu else device
+
+    layer.workspace = marlin_make_workspace(cuda_device, 4)
+    perm = torch.empty(0, dtype=torch.int, device=cuda_device)
 
     # WEIGHT
     # Repack weights to marlin format
-    # Strategy: copy to CPU, free GPU, repack, copy back.
     for name in ["w13_weight", "w2_weight"]:
         weight = getattr(layer, name)
+        tensor_list = []
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
@@ -208,37 +212,28 @@ def prepare_moe_fp8_layer_for_marlin(
         else:
             assert weight.shape == (e, size_n, size_k)
 
-        # Copy to CPU
-        weight_cpu = weight.cpu()
-
-        # Free GPU memory by resizing to empty
-        weight.data.resize_(0)
-
-        # Repack, processing one expert at a time through GPU
-        output_cpu = torch.empty(
-            (e, size_k // 16, size_n * 4),
-            device="cpu",
-            dtype=torch.int32,
-            pin_memory=True,
-        )
-
         for i in range(e):
-            expert_gpu = weight_cpu[i].to(device)
-            qweight = pack_fp8_to_int32(expert_gpu, size_k_first)
-            del expert_gpu
+            # Move expert to GPU for kernel execution
+            expert_weight = weight[i].to(cuda_device) if is_cpu else weight[i]
+            qweight = pack_fp8_to_int32(expert_weight, size_k_first)
+            if is_cpu:
+                del expert_weight
             if not size_k_first:
                 qweight = qweight.T.contiguous()
+
             marlin_qweight = gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
             )
-            output_cpu[i].copy_(marlin_qweight)
-            del qweight, marlin_qweight
+            # Keep result on CPU if input was on CPU
+            if is_cpu:
+                marlin_qweight = marlin_qweight.cpu()
+            tensor_list.append(marlin_qweight)
+            del qweight
 
-        del weight_cpu
+        weight = torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+        weight = torch.nn.Parameter(weight, requires_grad=False)
 
-        # Copy result back to GPU
-        setattr(layer, name, torch.nn.Parameter(output_cpu.to(device), requires_grad=False))
-        del output_cpu
+        setattr(layer, name, weight)
 
     # WEIGHT SCALES
     # Permute scales
