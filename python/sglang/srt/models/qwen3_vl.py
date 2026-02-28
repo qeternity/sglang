@@ -1025,28 +1025,33 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
+        encoder_only = getattr(config, "encoder_only", False)
+        language_only = getattr(config, "language_only", False)
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        if language_only:
+            self.visual = None
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
-            self.config.encoder_only = getattr(config, "encoder_only", False)
-            self.config.language_only = getattr(config, "language_only", False)
+        self.config.encoder_only = encoder_only
+        self.config.language_only = language_only
 
-        if not hasattr(config, "encoder_only") or not config.encoder_only:
+        if not encoder_only:
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
@@ -1077,9 +1082,22 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = config.vision_config.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            [] if language_only else config.vision_config.deepstack_visual_indexes
+        )
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        self.use_deepstack = {
+            Modality.IMAGE: not language_only,
+            Modality.VIDEO: not language_only,
+        }
+
+    def _require_visual(self):
+        if self.visual is None:
+            raise RuntimeError(
+                "This model was initialized with language_only=True and cannot "
+                "process image or video inputs."
+            )
+        return self.visual
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -1096,9 +1114,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        visual = self._require_visual()
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+            visual.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
@@ -1110,13 +1129,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if max_patches_per_call == 0 and max_images_per_call == 0:
             if self.use_data_parallel:
                 return run_dp_sharded_mrope_vision_model(
-                    self.visual,
+                    visual,
                     pixel_values,
                     image_grid_thw.tolist(),
                     rope_type="rope_3d",
                 )
             else:
-                return self.visual(pixel_values, grid_thw=image_grid_thw)
+                return visual(pixel_values, grid_thw=image_grid_thw)
 
         # compute the number of patches per image and the slice positions in pixel_values
         grid_thw_list = (
@@ -1182,13 +1201,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # run ViT once on this chunk without extra padding
             if self.use_data_parallel:
                 chunk_embeds = run_dp_sharded_mrope_vision_model(
-                    self.visual,
+                    visual,
                     pixel_chunk,
                     grid_chunk.tolist(),
                     rope_type="rope_3d",
                 )
             else:
-                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
+                chunk_embeds = visual(pixel_chunk, grid_thw=grid_chunk)
 
             # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
             all_chunk_embeds.append(chunk_embeds)
@@ -1200,11 +1219,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        visual = self._require_visual()
         for item in items:
-            item.feature = item.feature.to(self.visual.device)
+            item.feature = item.feature.to(visual.device)
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+            visual.dtype
         )
         # Memory optimization for item.feature:
         # 1. item.feature is released when request finished
@@ -1217,10 +1237,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+                visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+            video_embeds = visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):

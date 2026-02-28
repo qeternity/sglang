@@ -2615,11 +2615,6 @@ class ServerArgs:
                 "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
 
-        if self.language_only and len(self.encoder_urls) == 0:
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
-            )
-
         # Validate IB devices when mooncake backend is used
         if (
             self.disaggregation_transfer_backend == "mooncake"
