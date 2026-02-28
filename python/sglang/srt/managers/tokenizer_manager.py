@@ -408,7 +408,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.bootstrap_server = start_disagg_service(self.server_args)
 
         # Encoder Disaggregation
-        if self.server_args.language_only:
+        if self.server_args.language_only and self.server_args.encoder_urls:
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
@@ -496,7 +496,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
         self._req_stats_init(obj, request)
-        if self.server_args.language_only:
+        if self.server_args.language_only and hasattr(self, "mm_receiver"):
             self._handle_epd_disaggregation_encode_request(obj)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
@@ -717,6 +717,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
                 if self.server_args.language_only:
+                    if not hasattr(self, "mm_receiver"):
+                        raise ValueError(
+                            "language_only without --encoder-urls cannot accept "
+                            "image, video, or audio inputs"
+                        )
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         img_data=obj.image_data,
                         mm_processor=self.mm_processor,
