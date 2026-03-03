@@ -665,6 +665,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         config: Qwen3_5TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        embed_tokens_module: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -675,12 +676,15 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Embedding layer
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-            )
+            if embed_tokens_module is not None:
+                self.embed_tokens = embed_tokens_module
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 

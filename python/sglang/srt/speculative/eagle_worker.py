@@ -154,7 +154,8 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_model = self.target_worker.model_runner.model
+        embed, head = target_model.get_embed_and_head()
 
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
@@ -180,7 +181,16 @@ class EAGLEWorker(TpModelWorker):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+            if (
+                self.hot_token_id is None
+                and hasattr(self.draft_model_runner.model, "set_embed_and_head_modules")
+            ):
+                self.draft_model_runner.model.set_embed_and_head_modules(
+                    target_model.model.embed_tokens,
+                    target_model.lm_head,
+                )
+            else:
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (

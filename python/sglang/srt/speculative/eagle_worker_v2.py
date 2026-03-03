@@ -191,7 +191,8 @@ class EagleDraftWorker(BaseDraftWorker):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_model = self.target_worker.model_runner.model
+        embed, head = target_model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
@@ -216,7 +217,16 @@ class EagleDraftWorker(BaseDraftWorker):
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
-            self.draft_runner.model.set_embed_and_head(embed, head)
+            if (
+                self.hot_token_id is None
+                and hasattr(self.draft_runner.model, "set_embed_and_head_modules")
+            ):
+                self.draft_runner.model.set_embed_and_head_modules(
+                    target_model.model.embed_tokens,
+                    target_model.lm_head,
+                )
+            else:
+                self.draft_runner.model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
