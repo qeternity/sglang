@@ -262,6 +262,7 @@ class SchedulerMetricsMixin:
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and hasattr(self, "mm_receiver")
         ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
         graph_backend = defaultdict(
@@ -474,6 +475,7 @@ class SchedulerMetricsMixin:
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and hasattr(self, "mm_receiver")
         ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 

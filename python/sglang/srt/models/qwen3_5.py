@@ -58,7 +58,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -685,6 +685,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        embed_tokens_module: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -695,12 +696,15 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Embedding layer
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-            )
+            if embed_tokens_module is not None:
+                self.embed_tokens = embed_tokens_module
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -745,6 +749,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        self.layers_to_capture = []
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -844,6 +849,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            layer_id = get_layer_id(name)
+
+            if layer_id is not None and (
+                layer_id < self.start_layer or layer_id >= self.end_layer
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1098,7 +1109,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
 
     @property
     def start_layer(self) -> int:
@@ -1149,6 +1162,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            layer_id = get_layer_id(name)
+
+            if (
+                layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1207,7 +1232,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
@@ -1296,6 +1323,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            layer_id = get_layer_id(name)
+
+            if (
+                layer_id is not None
+                and hasattr(self, "model")
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(

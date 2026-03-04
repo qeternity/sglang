@@ -24,16 +24,47 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+class DeferredSharedEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._shared_module = None
+        self.weight = None
+
+    def attach_module(self, module: nn.Module) -> None:
+        self._shared_module = module
+        self.weight = module.weight
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self._shared_module is None:
+            raise RuntimeError(
+                "Qwen3.5 MTP draft embedding has not been attached to the target model."
+            )
+        return self._shared_module(input_ids)
+
+
+class DeferredSharedLMHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = None
+
+    def attach_module(self, module: nn.Module) -> None:
+        self.weight = module.weight
 
 
 class Qwen3_5ForCausalLMMTP(nn.Module):
@@ -58,6 +89,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        embed_tokens_module = (
+            DeferredSharedEmbedding() if self.pp_group.is_first_rank else None
+        )
 
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
@@ -72,18 +106,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
+            embed_tokens_module=embed_tokens_module,
         )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                self.lm_head = DeferredSharedLMHead()
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -100,14 +130,50 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
+        self._materialize_embed_tokens()
         del self.model.embed_tokens.weight
-        if not self.config.tie_word_embeddings:
-            del self.lm_head.weight
-
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+
+        if not self.config.tie_word_embeddings:
+            self._materialize_lm_head()
+            del self.lm_head.weight
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def set_embed_and_head_modules(self, embed_tokens: nn.Module, lm_head: nn.Module):
+        if isinstance(self.model.embed_tokens, DeferredSharedEmbedding):
+            self.model.embed_tokens.attach_module(embed_tokens)
+        else:
+            self.model.embed_tokens = embed_tokens
+
+        if get_pp_group().is_last_rank:
+            if self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            elif isinstance(self.lm_head, DeferredSharedLMHead):
+                self.lm_head.attach_module(lm_head)
+            else:
+                self.lm_head = lm_head
+
+    def _materialize_embed_tokens(self) -> None:
+        if not isinstance(self.model.embed_tokens, DeferredSharedEmbedding):
+            return
+        embed_tokens = VocabParallelEmbedding(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            org_num_embeddings=self.config.vocab_size,
+            enable_tp=not is_dp_attention_enabled(),
+        )
+        self.model.embed_tokens = embed_tokens
+
+    def _materialize_lm_head(self) -> None:
+        if not isinstance(self.lm_head, DeferredSharedLMHead):
+            return
+        self.lm_head = ParallelLMHead(
+            self.config.vocab_size,
+            self.config.hidden_size,
+            quant_config=self.quant_config,
+        )
 
     @torch.no_grad()
     def forward(
