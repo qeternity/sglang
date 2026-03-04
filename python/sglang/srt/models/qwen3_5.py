@@ -1081,6 +1081,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         is_nextn: bool = False,
+        embed_tokens_module: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1091,12 +1092,15 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Embedding layer
         if self.pp_group.is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                enable_tp=not is_dp_attention_enabled(),
-            )
+            if embed_tokens_module is not None:
+                self.embed_tokens = embed_tokens_module
+            else:
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                )
         else:
             self.embed_tokens = PPMissingLayer()
 
@@ -1130,7 +1134,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-
         self.layers_to_capture = []
 
     def get_input_embeddings(self):
@@ -1251,10 +1254,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
+
+            if layer_id is not None and (
+                layer_id < self.start_layer or layer_id >= self.end_layer
             ):
                 continue
 
@@ -1532,7 +1534,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -1608,7 +1612,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
-                and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
                 continue
@@ -1685,7 +1688,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes if self.visual is not None else []
+        )
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -1856,7 +1861,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
-                and hasattr(self, "start_layer")
                 and (layer_id < self.start_layer or layer_id >= self.end_layer)
             ):
                 continue

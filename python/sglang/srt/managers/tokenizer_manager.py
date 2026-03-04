@@ -597,7 +597,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
         self._init_req_state(obj, request)
-        if self.server_args.language_only:
+        if self.server_args.language_only and hasattr(self, "mm_receiver"):
             self._handle_epd_disaggregation_encode_request(obj)
 
         # Log the request
@@ -834,6 +834,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 or self.server_args.encoder_transfer_backend == "zmq_to_tokenizer"
             ):
                 if self.server_args.language_only:
+                    if not hasattr(self, "mm_receiver"):
+                        raise ValueError(
+                            "language_only without --encoder-urls cannot accept "
+                            "image, video, or audio inputs"
+                        )
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
