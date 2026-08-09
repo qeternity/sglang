@@ -33,8 +33,8 @@ def _load_metal_rope_pool_fused():
         raise ImportError(
             "sgl_kernel.metal is importable, but the native Metal extension "
             f"or metallib is not available.{reason} Install the Metal kernels "
-            "with `uv run sgl-kernel/setup_metal.py install` from the SGLang "
-            "repo root in the active environment."
+            "with `uv run python/sglang/kernels/aot/setup_metal.py install` "
+            "from the SGLang repo root in the active environment."
         ) from import_error
     return metal.rope_pool_fused
 
@@ -204,7 +204,7 @@ class MlxAOTKernelContext:
         req_pool_idx: dict[str, int],
         req_to_token_pool: Any | None,
         layer_caches: list[list[ContiguousAttentionKVCache]],
-    ) -> "MlxAOTKernelContext":
+    ) -> MlxAOTKernelContext:
         """Build optional AOT context for one batched decode step."""
         if not aot_kernels.rope.enabled or kv_pool is None:
             return cls()
