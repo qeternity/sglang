@@ -15,7 +15,6 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
 import logging
-import math
 import re
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -78,7 +77,6 @@ from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
-    get_int_env_var,
     is_cpu,
     is_npu,
     round_up,
@@ -1244,7 +1242,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
-        if language_only:
+        self.language_model_only = getattr(config, "language_model_only", False)
+        if self.language_model_only:
             self.visual = None
         else:
             self.visual = Qwen3VLMoeVisionModel(
@@ -1298,7 +1297,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = (
+            not self.language_model_only and "mrope_section" in self.config.rope_scaling
+        )
 
         self.logits_processor = LogitsProcessor(self.config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -1306,25 +1307,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         # 8, 16, 24 layer will be merged to 0, 1, 2 layer of decoder output hidden_states
 
         # deepstack
-        self.deepstack_visual_indexes = (
-            [] if language_only else config.vision_config.deepstack_visual_indexes
-        )
-        self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-        self.use_deepstack = {
-            Modality.IMAGE: not language_only,
-            Modality.VIDEO: not language_only,
-        }
+        if not self.language_model_only:
+            self.deepstack_visual_indexes = (
+                config.vision_config.deepstack_visual_indexes
+            )
+            self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
+            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+        else:
+            self.deepstack_visual_indexes = []
+            self.num_deepstack_embeddings = 0
+            self.use_deepstack = {}
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
-    def _require_visual(self):
-        if self.visual is None:
-            raise RuntimeError(
-                "This model was initialized with language_only=True and cannot "
-                "process image or video inputs."
-            )
-        return self.visual
 
     def separate_deepstack_embeds(self, embedding):
         assert (
@@ -1350,138 +1345,59 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return int(getattr(cfg, "num_hidden_layers", 0))
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        if mm_inputs and mm_inputs.mm_items:
+            _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        visual = Qwen3VLForConditionalGeneration._require_visual(self)
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=visual.device,
-            dtype=visual.dtype,
-        )
+        _require_vision(self)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-
-        max_patches_per_call = get_int_env_var("SGLANG_VLM_MAX_PATCHES_PER_VIT", 0)
-        max_images_per_call = get_int_env_var("SGLANG_VLM_MAX_IMAGES_PER_VIT", 0)
-
-        if max_patches_per_call == 0 and max_images_per_call == 0:
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    visual,
-                    pixel_values,
-                    image_grid_thw.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                return visual(pixel_values, grid_thw=image_grid_thw)
-
-        # compute the number of patches per image and the slice positions in pixel_values
-        grid_thw_list = (
-            image_grid_thw.tolist()
-        )  # List[List[int]], each is [T, H, W] or similar
-        patches_per_image = [int(math.prod(g)) for g in grid_thw_list]
-        num_images = len(patches_per_image)
-
-        # cumulative sum used to slice pixel_values along the image dimension
-        cum_patches = [0]
-        for p in patches_per_image:
-            cum_patches.append(cum_patches[-1] + p)
-        total_patches = cum_patches[-1]
-
-        assert pixel_values.size(0) == total_patches, (
-            f"pixel_values rows ({pixel_values.size(0)}) "
-            f"!= total patches ({total_patches})"
-        )
-
-        # split into chunks in image order, each chunk obeys the patch/image limits
-        all_chunk_embeds: List[torch.Tensor] = []
-        img_start = 0
-
-        while img_start < num_images:
-            img_end = img_start
-            patches_in_chunk = 0
-            images_in_chunk = 0
-
-            # try to pack more images into the current chunk until some limit would be exceeded
-            while img_end < num_images:
-                next_patches = patches_per_image[img_end]
-
-                # if adding this image would exceed the patch limit, stop
-                if (
-                    max_patches_per_call > 0
-                    and patches_in_chunk + next_patches > max_patches_per_call
-                ):
-                    break
-
-                # if adding this image would exceed the image-count limit, also stop
-                if (
-                    max_images_per_call > 0
-                    and images_in_chunk + 1 > max_images_per_call
-                ):
-                    break
-
-                patches_in_chunk += next_patches
-                images_in_chunk += 1
-                img_end += 1
-
-            # extreme case: the first image alone exceeds the patch limit -> at least ensure img_end > img_start
-            if img_end == img_start:
-                img_end = img_start + 1
-                patches_in_chunk = patches_per_image[img_start]
-                images_in_chunk = 1
-
-            # slice pixel_values and grid_thw according to [img_start:img_end]
-            patch_start = cum_patches[img_start]
-            patch_end = cum_patches[img_end]
-            pixel_chunk = pixel_values[patch_start:patch_end]
-            grid_chunk = image_grid_thw[img_start:img_end]
-
-            # run ViT once on this chunk without extra padding
-            if self.use_data_parallel:
-                chunk_embeds = run_dp_sharded_mrope_vision_model(
-                    visual,
-                    pixel_chunk,
-                    grid_chunk.tolist(),
-                    rope_type="rope_3d",
-                )
-            else:
-                chunk_embeds = visual(pixel_chunk, grid_thw=grid_chunk)
-
-            # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
-            all_chunk_embeds.append(chunk_embeds)
-
-            # next batch
-            img_start = img_end
-
-        # concatenate back the full image embedding sequence
-        return torch.cat(all_chunk_embeds, dim=0)
+        return self._get_visual_feature(items, image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        visual = Qwen3VLForConditionalGeneration._require_visual(self)
-        pixel_values = materialize_multimodal_features(
-            [item.feature for item in items],
-            device=visual.device,
-            dtype=visual.dtype,
-        )
-        # Memory optimization for item.feature:
-        # 1. item.feature is released when request finished
-        # 2. High concurrency may cause device OOM due to delayed release
-        # 3. Fix: Offload item.feature to CPU, move to device only when needed
-        for item in items:
-            item.feature = item.feature.to("cpu")
+        _require_vision(self)
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        assert pixel_values.dim() == 2, pixel_values.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        return self._get_visual_feature(items, video_grid_thw)
+
+    def _get_visual_feature(
+        self, items: List[MultimodalDataItem], grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        assert grid_thw.dim() == 2, grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+                self.visual,
+                None,
+                grid_thw.tolist(),
+                rope_type="rope_3d",
+                load_local_pixel_values=partial(self._materialize_visual_items, items),
+                pixel_values_device=self.visual.device,
+                pixel_values_dtype=self.visual.dtype,
             )
-        else:
-            video_embeds = visual(pixel_values, grid_thw=video_grid_thw)
-        return video_embeds
+        pixel_values = self._materialize_visual_items(items, range(len(items)))
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        return self.visual(pixel_values, grid_thw=grid_thw)
+
+    def _materialize_visual_items(
+        self, items: List[MultimodalDataItem], indices: Iterable[int]
+    ) -> torch.Tensor:
+        device = self.visual.device
+        device_index = device.index
+        if device.type == "cuda" and device_index is None:
+            device_index = torch.cuda.current_device()
+        if device.type == "cuda":
+            parallel = get_parallel()
+            consumer_count = max(parallel.tp_size, 1)
+
+        features = []
+        for index in indices:
+            item = items[index]
+            if device.type == "cuda":
+                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+            features.append(item.feature)
+        return materialize_multimodal_features(
+            features, device=device, dtype=self.visual.dtype
+        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1517,25 +1433,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
-                assert positions.ndim == 2 and positions.size(0) == 3, (
-                    "multimodal section rotary embedding requires "
-                    f"(3, seq_len) positions, but got {positions.size()}"
-                )
-
-        hidden_states = general_mm_embed_routine(
-            input_ids=input_ids,
-            forward_batch=forward_batch,
-            language_model=self.model,
-            multimodal_model=self,
-            positions=positions,
-            use_deepstack=self.use_deepstack,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        if self.language_model_only:
+            hidden_states = self.model(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            if not (
+                forward_batch.forward_mode.is_decode()
+                or not forward_batch.contains_image_inputs()
+            ):
+                if self.is_mrope_enabled:
+                    assert positions.ndim == 2 and positions.size(0) == 3, (
+                        "multimodal section rotary embedding requires "
+                        f"(3, seq_len) positions, but got {positions.size()}"
+                    )
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self,
+                positions=positions,
+                use_deepstack=self.use_deepstack,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1665,6 +1588,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             ]  # Specific layers for EAGLE3 support
         else:
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+
+def _require_vision(model) -> None:
+    if (
+        getattr(model, "language_model_only", False)
+        and getattr(model, "visual", None) is None
+    ):
+        raise RuntimeError(
+            "Checkpoint is marked language_model_only=True and was loaded "
+            "without a vision encoder; multimodal inputs are not supported."
+        )
 
 
 EntryClass = Qwen3VLForConditionalGeneration
