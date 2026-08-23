@@ -123,7 +123,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
+    emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
+    view_aiter_fused_rms_transposed_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
@@ -419,14 +421,19 @@ class DeepseekV2MLP(nn.Module):
             if self._fused_clamp_use_fp8:
                 from aiter import dtypes
 
+                _emit_bpre = emit_transposed_bpreshuffle_scale(
+                    gate_up.shape[0], on_bpreshuffle_gfx95=_use_aiter_bpreshuffle_gfx95
+                )
                 x_fp8, x_scale = fused_clamp_act_mul(
                     gate_up,
                     swiglu_limit=self.swiglu_limit,
                     activation="silu",
                     dtype_quant=dtypes.fp8,
-                    transpose_scale=False,
+                    transpose_scale=_emit_bpre,
                 )
-                if _use_aiter_bpreshuffle_gfx95:
+                if _emit_bpre:
+                    x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
+                elif _use_aiter_bpreshuffle_gfx95:
                     x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
                 x = (x_fp8, x_scale)
             else:
@@ -732,7 +739,6 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
-                or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -812,7 +818,6 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
-            or get_moe_a2a_backend().is_deepep_v2()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -835,7 +840,6 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
-            or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -2707,10 +2711,7 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    is_a2a_moe = (
-                        is_deepep_class_backend()
-                        or get_moe_a2a_backend().is_deepep_v2()
-                    )
+                    is_a2a_moe = is_deepep_class_backend()
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -2730,11 +2731,10 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        self.enable_a2a_moe = (
-            get_moe_a2a_backend().is_deepep()
-            or get_moe_a2a_backend().is_mooncake()
-            or get_moe_a2a_backend().is_deepep_v2()
-        )
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            self.enable_a2a_moe = True
+        else:
+            self.enable_a2a_moe = False
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
