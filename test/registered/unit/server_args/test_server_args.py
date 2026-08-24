@@ -1872,6 +1872,32 @@ class TestBreakableCudaGraphMultimodalAllowlist(CustomTestCase):
         )
 
 
+class TestLanguageModelOnly(CustomTestCase):
+    def _args_for_architecture(self, architecture):
+        args = ServerArgs(model_path="dummy", language_model_only=True)
+        args.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
+        return args
+
+    def test_qwen3_5_architectures_are_supported(self):
+        for architecture in (
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                self._args_for_architecture(architecture)._handle_language_model_only()
+
+    def test_unsupported_architecture_is_rejected(self):
+        args = self._args_for_architecture("Qwen3VLForConditionalGeneration")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--language-model-only does not support",
+        ):
+            args._handle_language_model_only()
+
+
 class TestCutedslMoeMaxNumTokens(CustomTestCase):
     """The shared CuteDSL MoE per-forward token bound. Fields are set directly
     to exercise the math independently of __post_init__ resolution.
