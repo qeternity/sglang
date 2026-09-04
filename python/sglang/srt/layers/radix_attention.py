@@ -230,6 +230,7 @@ class RadixAttention(nn.Module):
                     "score_mod",
                     "aux_tensors",
                     "rel_bias",
+                    "return_lse",
                     "q_descale",
                     "k_descale",
                     "v_descale",
@@ -240,13 +241,16 @@ class RadixAttention(nn.Module):
                 # schema; route this backend's extend attention through the plain
                 # eager path.
                 if is_in_breakable_cuda_graph():
-                    breakable_attention_with_output_extra_kwargs(
+                    lse = breakable_attention_with_output_extra_kwargs(
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
                     )
                 else:
-                    attention_with_output_extra_kwargs(
+                    lse = attention_with_output_extra_kwargs(
                         q, k, v, output, save_kv_cache, self.layer_id, kwargs
                     )
+                if kwargs.get("return_lse") or forward_batch.mha_return_lse:
+                    assert lse is not None
+                    return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
                 return output
             # Chunked-prefix MHA needs LSE to merge independently normalized
             # suffix and cached-prefix attention states.
@@ -319,7 +323,7 @@ def _unified_attention_with_output_impl(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_query_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_query_num_tokens = forward_batch.global_num_token_non_padded_cpu
     # Ordinary PCG attention pads Q/K/V to the same token bucket. Prefix MHA
     # instead supplies a fixed-capacity K/V chunk whose extent is independent
     # of the suffix queries, so its caller must preserve that separate extent.
@@ -527,7 +531,7 @@ def unified_sparse_attention_with_output(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(attn_out, idx_out)
@@ -586,7 +590,7 @@ def attention_with_output_extra_kwargs(
     save_kv_cache: bool,
     layer_id: int,
     extra_kwargs: dict,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Breakable/tc_piecewise attention for backends whose forward needs kwargs
     that cannot cross the ``unified_attention_with_output`` custom-op schema --
     a ``score_mod`` callable and/or ``aux_tensors`` (e.g. Inkling's relative-bias
@@ -598,7 +602,7 @@ def attention_with_output_extra_kwargs(
     context = get_tc_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
-    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
 
     if real_num_tokens == 0:
         _zero_skipped_attn_outputs(output)
@@ -628,12 +632,24 @@ def attention_with_output_extra_kwargs(
     )
     forward_batch.out_cache_loc = original_out_cache_loc
 
+    return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
+    if return_lse:
+        assert isinstance(ret, tuple)
+        ret, lse, *_ = ret
+    else:
+        assert isinstance(ret, torch.Tensor)
+        lse = None
+
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
 
     if _is_hip:
         _zero_padded_pcg_tail(output, context)
-    return
+    if lse is not None and lse.shape[0] != output.shape[0]:
+        padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
+        padded_lse[:real_num_tokens].copy_(lse)
+        lse = padded_lse
+    return lse
 
 
 breakable_attention_with_output_extra_kwargs = eager_on_graph(True)(
