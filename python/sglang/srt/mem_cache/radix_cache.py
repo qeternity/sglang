@@ -311,10 +311,11 @@ class TreeNode:
         return self.hash_value[-1]
 
     def get_prefix_hash_values(self, node: TreeNode) -> List[str]:
-        if node is None or node.hash_value is None:
-            return []
-
-        return node.get_prefix_hash_values(node.parent) + node.hash_value
+        chunks = []
+        while node is not None and node.hash_value is not None:
+            chunks.append(node.hash_value)
+            node = node.parent
+        return [value for chunk in reversed(chunks) for value in chunk]
 
     def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
@@ -346,7 +347,9 @@ class RadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
-        self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.eviction_strategy = get_eviction_strategy(
+            self.eviction_policy, params.eviction_policy_config
+        )
 
         self.evictable_leaves = set()
         self.reset()
@@ -514,6 +517,31 @@ class RadixCache(BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
+            # A request that was never cached while unfinished can add its
+            # whole prompt and generated output as one leaf. Split that leaf at
+            # the prompt boundary so LRU eviction can discard output KV without
+            # also losing the reusable prompt KV. Reinserting a prefix only
+            # changes radix topology; it reuses the indices inserted above.
+            prompt_key = RadixKey(
+                token_ids[: len(req.origin_input_ids)],
+                req.extra_key,
+                is_bigram=self.is_eagle,
+                cache_salt=req.cache_salt,
+            ).page_aligned(self.page_size)
+            if 0 < len(prompt_key) < key_len:
+                self.insert(
+                    InsertParams(
+                        key=prompt_key,
+                        value=values[: len(prompt_key)],
+                        priority=priority + 1,
+                        # Topology-only re-insert: this request created these
+                        # nodes moments ago, so counting it as a hit is the
+                        # same self-referencing inflation `chunked` exists to
+                        # suppress. hit_count drives eviction order, so an
+                        # extra bump would silently promote every prompt node.
+                        chunked=True,
+                    )
+                )
             freed_end = result.prefix_len
         else:
             freed_end = key_len
