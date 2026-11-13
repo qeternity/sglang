@@ -260,6 +260,8 @@ def resolve_draft_embed_and_head(
     loads the draft's own from the checkpoint."""
     embed, head = resolve_target_embed_and_head(target_model, draft_model=draft_model)
     if embed is None:
+        if hasattr(draft_model, "materialize_embed_tokens"):
+            draft_model.materialize_embed_tokens()
         embed = load_draft_embedding_from_checkpoint(
             draft_model, model_path, revision=revision, load_config=load_config
         )

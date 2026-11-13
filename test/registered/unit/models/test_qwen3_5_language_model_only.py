@@ -8,14 +8,16 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestLanguageModelOnlyWeightLoading(unittest.TestCase):
+class TestLanguageModelOnlyWeightLoading(CustomTestCase):
     def test_dense_loader_skips_visual_weights(self):
         model = SimpleNamespace(
             language_model_only=True,
+            pooler=None,
             named_parameters=lambda **_: (),
         )
 
