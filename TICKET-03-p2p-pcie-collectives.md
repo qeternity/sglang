@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090, PCIe x16 Gen4, **no NVLink**; operator runs **patched drivers with P2P over PCIe enabled**
 - **Dependencies:** TICKET-00 (needs a loadable model to exercise the full server path; the probe itself can start immediately)
 - **Estimate:** 2 days (probe passed → the "P2P works" branch: 1-shot P2P-read AR for decode payloads + NCCL for large messages)
-- **Status:** probe done 2026-11-21 (Mode A + NCCL-for-large); implementation pending
+- **Status:** implemented locally 2026-11-21 (size-dispatched P2P/NCCL path in `inkling2_comm.py` + CPU dispatch tests; GPU validation probe `t3_p2p_validate.py` pending on sauron with T5/T6)
 
 ## Problem
 
@@ -131,3 +131,66 @@ Probe script: `t3_p2p_probe.py` (repo root; self-contained, spawns 2 ranks).
   CUDA graph capture") — keep the warmup step.
 - Driver patch stability: if the operator's driver breaks a torch update, the whole plan
   silently degrades — the probe at server start is also the canary.
+
+## Implementation log (2026-11-21, local; sauron validation pending)
+
+All dispatch lives in `python/sglang/kernels/ops/communication/inkling2_comm.py`;
+**no model-file changes were needed** — the existing MoE-combine call site
+(`inkling2_moe.py` `combine` path) already handles the new contracts:
+
+- `multicast_all_reduce_input` now returns **None** when there is no multicast
+  and the payload exceeds the P2P band; `marlin_sm90.source_partial(out=None)`
+  allocates its own fp32 buffer and the reduce goes through NCCL.
+- `multicast_all_reduce` now: multimem when `has_multicast(group)`; else
+  P2P one-shot ≤ `P2P_MAX_BYTES` (256 KB); else NCCL (`group.all_reduce`
+  copied back in place, preserving the in-place contract).
+
+New pieces in `inkling2_comm.py`:
+
+- `has_multicast(group)` — cached `symm_mem` rendezvous of a 16-element
+  buffer; `bool(handle.multicast_ptr)`. The rendezvous is collective and
+  happens once per group on the first collective call (eager warmup, before
+  any graph capture — the probe raises during capture, like
+  `_multicast_buffer`).
+- `_P2PAllReduce` + `_p2p_state(group, numel, dtype, device)` — per
+  (group, dtype, next-power-of-two capacity) state: one symmetric buffer of
+  `2 × world × capacity` (two rotating input banks, per-rank slots — the same
+  double-bank invariant as `_OneShotAllReduce`, so a host-ahead call k+1 can
+  never overwrite the bank a lagging peer still reads in call k), one flags
+  symmetric buffer for the existing `_peer_barrier` kernel (P2P-based,
+  arch-generic; `launch_pdl` guarded by `is_arch_support_pdl()`), and a local
+  output region. The sum kernel is the triton `_p2p_rank_sum` (fp32
+  accumulation, same numeric contract as the existing `_rank_sum` SM100
+  path). No new CUDA JIT — triton compiles it at first use on the box.
+- `all_reduce` tail (previously `comm.buffer` or `_multicast_view` +
+  `multimem` — the hard-raise on PCIe): `has_multicast` → existing path
+  unchanged; else P2P (copy into the region view + `reduce`) ≤ 256 KB, else
+  `group.all_reduce` (NCCL).
+- `multicast_all_reduce_input`: no multicast + ≤ 256 KB → the P2P region
+  view (producer writes directly, as before); above the band → None.
+
+Notes:
+
+- The model-layer comm module (`srt/models/inkling_common/kernels/comm.py`)
+  needs **no change**: its symm-mem fast path is gated on
+  `_INKLING_AR_WORLD_SIZES = (4, 6, 8)`, so on the 2-GPU box it already
+  falls through to the NCCL tail (`group.all_reduce`,
+  `reduce_scatter_tensor`, `group.all_gather`) for every shape.
+- `oneshot_all_reduce_input` already returns None on world 2 (it is gated on
+  world ∈ {4, 8} + multicast), so the attention path falls to
+  `all_reduce(..., multicast=True)`, which is now the P2P/NCCL dispatch.
+- The decode AR (4.6 KB) and the MoE combine (≤ 256 KB) take the P2P path;
+  prefill-sized reductions and the fp32 MoE combine at large token counts
+  take NCCL. `P2P_MAX_BYTES = 256 * 1024` matches the T1 chunk boundary.
+
+Tests: `test/registered/unit/models/test_inkling2_p2p_comm.py` (8 CPU tests,
+`base-a-test-cpu`: dispatch to P2P vs NCCL by size, the boundary at 256 KB,
+state reuse across calls, world-1 passthrough, dtype guard). Regression:
+216 passed / 6 skipped (CUDA-only) across the four inkling2 suites +
+model_overrides; ruff clean.
+
+GPU validation (sauron, next deploy): `t3_p2p_validate.py` (repo root,
+single command) runs the production functions — sections A (has_multicast
+False), B (P2P band correctness vs NCCL reference + latency + 30-call
+bank-rotation stress), C (NCCL band + input None + GB/s), D (mixed-size
+state coexistence). PASS bar: all correctness checks + P2P AR < 50 µs.

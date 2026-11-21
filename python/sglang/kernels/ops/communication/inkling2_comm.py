@@ -24,6 +24,116 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
     tl.store(Y + indices, total, indices < N)
 
 
+# Payloads at or below this size all-reduce through direct peer reads (the
+# P2P path below); larger ones go through NCCL. Sized from the sauron probe
+# (TICKET-03): one-shot P2P-read ARs at decode size cost ~8 us, while large
+# P2P transfers over the patched PCIe link degrade to ~1-2 GB/s.
+P2P_MAX_BYTES = 256 * 1024
+
+
+@triton.jit
+def _p2p_rank_sum(
+    InPtrs, Out, N, CAP: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr
+):
+    """Sum rank r's slot (offset r*CAP) read from every rank's own buffer."""
+    indices = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    total = tl.full((BLOCK,), 0.0, tl.float32)
+    for rank in tl.static_range(WORLD):
+        base = tl.load(InPtrs + rank).to(tl.pointer_type(Out.dtype.element_ty))
+        total += tl.load(base + rank * CAP + indices, indices < N, other=0.0).to(
+            tl.float32
+        )
+    tl.store(Out + indices, total.to(Out.dtype.element_ty), indices < N)
+
+
+class _P2PAllReduce:
+    """One-shot all-reduce by direct peer reads, for P2P-only hardware (a 3090/
+    4090 PCIe box has peer mapping but no NVLink multicast).
+
+    Each rank writes its input into its own slot of the current input bank of
+    the symmetric buffer, a grid barrier publishes every write, and each rank
+    reads the world slots through the peer pointers and writes the sum to a
+    local output region. The input banks alternate per call (as in
+    _OneShotAllReduce) so a host-ahead call k+1 can never overwrite the bank a
+    lagging peer still reads in call k; the output region is rewritten by the
+    next call, after its consumer has passed on the stream (the same contract
+    as oneshot_all_reduce).
+    """
+
+    def __init__(self, group, capacity, dtype, device):
+        world = group.world_size
+        self.world = world
+        self.capacity = capacity
+        self.buffer, handle = _symm(group, 2 * world * capacity, dtype, device)
+        self.flags, flags_handle = _symm(
+            group, ar.flags_numel(world), torch.uint32, device, flags=True
+        )
+        self.in_ptrs = _ptrs(handle, device)
+        self.flag_ptrs = _ptrs(flags_handle, device)
+        self.state = torch.zeros(ar.STATE_SIZE, device=device, dtype=torch.uint32)
+        self.out = torch.empty(capacity, dtype=dtype, device=device)
+        self.rank = handle.rank
+        self.bank = 0
+
+    def input(self, numel):
+        off = self.bank * self.world * self.capacity + self.rank * self.capacity
+        return self.buffer[off : off + numel]
+
+    def reduce(self, x):
+        """Reduce x (which must be the view from input(), or already in it) in
+        place conceptually; returns the summed view, rewritten per call."""
+        n = x.numel()
+        _peer_barrier[(1,)](
+            self.flag_ptrs,
+            self.state,
+            self.rank,
+            self.world,
+            num_warps=1,
+            **({"launch_pdl": True} if is_arch_support_pdl() else {}),
+        )
+        _p2p_rank_sum[(triton.cdiv(n, 256),)](
+            self.in_ptrs + self.bank * self.world * self.capacity,
+            self.out,
+            n,
+            self.capacity,
+            self.world,
+            256,
+            enable_fp_fusion=False,
+        )
+        self.bank = 1 - self.bank
+        return self.out[:n]
+
+
+_P2P: dict = {}
+
+
+def _p2p_state(group, numel, dtype, device):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Warm up the collective size before CUDA graph capture")
+    capacity = 1 << (numel - 1).bit_length()
+    key = (group.device_group.group_name, dtype, capacity)
+    state = _P2P.get(key)
+    if state is None:
+        state = _P2P[key] = _P2PAllReduce(group, capacity, dtype, device)
+    return state
+
+
+@cache_once
+def _multicast_probe(group_name, device):
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Warm up the collective before CUDA graph capture")
+    buffer = symm_mem.empty(16, device=device, dtype=torch.bfloat16)
+    return symm_mem.rendezvous(buffer, group_name).multicast_ptr
+
+
+def has_multicast(group) -> bool:
+    """Whether the group's symmetric memory has a multicast (multimem) pointer —
+    an NVLink hardware feature. PCIe P2P boxes (patched 3090 drivers) map peers
+    but cannot multicast; on those the collectives below dispatch to the P2P
+    read path or NCCL instead of the multimem kernels."""
+    return bool(_multicast_probe(group.device_group.group_name, _device()))
+
+
 def _device():
     return torch.device("cuda", torch.cuda.current_device())
 
@@ -83,6 +193,13 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
             peers, output, x.numel(), world, 256, enable_fp_fusion=False
         )
         return output
+    if not has_multicast(group):
+        if x.nbytes <= P2P_MAX_BYTES:
+            state = _p2p_state(group, x.numel(), x.dtype, x.device)
+            region = state.input(x.numel())
+            region.copy_(x.flatten())
+            return state.reduce(region).view_as(x)
+        return group.all_reduce(x)
     comm = group.torch_symm_mem_comm
     if comm is not None and comm.should_torch_symm_mem_allreduce(x):
         buffer = comm.buffer[: x.numel()]
@@ -94,18 +211,39 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
 
 def multicast_all_reduce_input(group, shape, dtype):
     """A view of the symmetric multicast buffer for a producer to write an all-reduce
-    input into; multicast_all_reduce reduces it in place."""
+    input into; multicast_all_reduce reduces it in place. Returns None when the
+    group has no multicast and the payload exceeds the P2P band: the caller
+    should then all-reduce with NCCL."""
     if group.world_size == 1:
         return torch.empty(shape, dtype=dtype, device=_device())
-    return _multicast_view(group, _device(), dtype, shape[0] * shape[1]).view(shape)
+    n = shape[0] * shape[1]
+    if not has_multicast(group):
+        if n * dtype.itemsize > P2P_MAX_BYTES:
+            return None
+        return _p2p_state(group, n, dtype, _device()).input(n).view(shape)
+    return _multicast_view(group, _device(), dtype, n).view(shape)
 
 
 def multicast_all_reduce(x, group):
+    """All-reduce x in place across the group. Uses the multimem kernel when the
+    group's symmetric memory has a multicast pointer; on P2P-only hardware
+    (no multicast) payloads at or below P2P_MAX_BYTES sum through direct peer
+    reads (x must already be the matching _p2p_state region view) and larger
+    ones go through NCCL."""
     if group.world_size == 1:
         return x
-    torch.ops.symm_mem.multimem_all_reduce_(
-        x.view(-1), "sum", group.device_group.group_name
-    )
+    if has_multicast(group):
+        torch.ops.symm_mem.multimem_all_reduce_(
+            x.view(-1), "sum", group.device_group.group_name
+        )
+        return x
+    if x.nbytes <= P2P_MAX_BYTES:
+        return (
+            _p2p_state(group, x.numel(), x.dtype, x.device)
+            .reduce(x.view(-1))
+            .view_as(x)
+        )
+    x.view(-1).copy_(group.all_reduce(x.view(-1)))
     return x
 
 
