@@ -145,3 +145,17 @@ and the numerical spot-check against the bf16 reference.
   competitive per GPU; prefill will be ~3–5× behind H200. Acceptable for the target workload.
 - The "sm90" naming in several files (`inkling2_marlin_sm90.py`, `inkling2_experts_sm90.py`)
   is now misleading after this ticket — rename is optional follow-up, not in scope.
+
+### Addendum (sauron bring-up, GEMV gate)
+
+`marlin_moe_gemv.cuh` (the small-batch expert GEMM) is Hopper-only by construction:
+thread-block clusters + distributed shared memory to sum the K splits, and unguarded
+PDL asm; its launch hard-codes `.use_pdl = true`. It cannot be ported to SM86
+(clusters/DSMEM are sm_90+ features), and `uses_gemv()` had no arch check, so SM8x
+decode (tokens <= 8) would have hit the same ptxas failure on the first decode forward.
+Fix: `uses_gemv()` now returns `False` when `is_arch_support_pdl()` is false (the SM90+
+probe already used by T3), routing small batches to the generic Marlin GEMM
+(`moe_wna16_marlin`, whose only arch floor is sm_80) — correct, just slower per call
+than the clustered GEMV; at 3090 MoE decode the GEMM path is the memory-bound one
+anyway. `moe_wna16_marlin.cuh` was audited: no PDL, no clusters, `#if SGL_CUDA_ARCH == 900`
+special-cases only — SM86-safe.

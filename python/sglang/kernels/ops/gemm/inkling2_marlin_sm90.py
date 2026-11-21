@@ -11,7 +11,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.jit.utils import load_jit
+from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
     ROW_LOOP_MIN_ROWS,
     _nvfp4_values,
@@ -242,6 +242,11 @@ def _gemv_module(nvfp4, n, k, splits, warps):
 
 def uses_gemv(marlin, tokens, num_local):
     """Whether gemv() beats gemm() for this many tokens (rows per expert <= tokens)."""
+    # The GEMV kernel is Hopper-only: it clusters K splits (thread-block
+    # clusters + distributed shared memory) and uses PDL, both sm_90+.
+    # SM8x (the 3090) takes the generic Marlin GEMM for small batches too.
+    if not is_arch_support_pdl():
+        return False
     nvfp4 = marlin[2] is not None
     return num_local <= GEMV_MAX_EXPERTS and tokens <= (8 if nvfp4 else 2)
 

@@ -106,8 +106,8 @@ __global__ void __launch_bounds__(kThreads) route_metadata_kernel(
   int const lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   for (int i = threadIdx.x; i < chunks * stride / 8; i += kThreads)
     reinterpret_cast<uint4*>(chunk_counts)[i] = make_uint4(0, 0, 0, 0);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int expert[kRounds], rank[kRounds];
   float weight[kRounds];
 #pragma unroll

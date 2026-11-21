@@ -143,8 +143,8 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(Params p) {
   // before waiting on the previous kernel, which writes none of them.
   constexpr bool kEarly = DECODE || WINDOW;
   if constexpr (!kEarly) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
   }
   int const row = blockIdx.x;
   int const col = (blockIdx.y * kThreads + threadIdx.x) * kVec;
@@ -189,8 +189,8 @@ __global__ void __launch_bounds__(kThreads) sconv_kernel(Params p) {
   }
 
   if constexpr (kEarly) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
   }
   constexpr bool kGather = TOP_K > 0;
   constexpr int kRowLoads = DECODE ? 1 : W;

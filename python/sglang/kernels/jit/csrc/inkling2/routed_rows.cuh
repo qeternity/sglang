@@ -76,7 +76,7 @@ __global__ void __launch_bounds__(H / In<T>::kVec / kChunks) routed_rows_kernel(
   };
   float scale = 0.0f;
   if (SCALED && first < last && first >= lo && first < hi) scale = scale_of(first);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  device::PDLWaitPrimary<true>();
   if (OWNED && calls != nullptr) out += (calls[0] & 1) * slot_size;
   for (int row = first; row < last; row += stride) {
     alignas(16) __nv_bfloat16 values[kVec];
@@ -99,7 +99,7 @@ __global__ void __launch_bounds__(H / In<T>::kVec / kChunks) routed_rows_kernel(
     }
     *reinterpret_cast<uint4*>(out + int64_t(row) * H + col) = *reinterpret_cast<uint4*>(values);
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLTriggerSecondary<true>();
 }
 
 template <int H, typename T, bool SCALED, bool OWNED>

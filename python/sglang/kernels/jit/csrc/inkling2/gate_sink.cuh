@@ -42,8 +42,8 @@ __global__ void __launch_bounds__(H* D / kVec) gate_sink_kernel(
   // The gate (qkvr projection) and sinks are written several kernels earlier.
   Bits const g = *reinterpret_cast<Bits const*>(gate + row * sg + col);
   float const s = __bfloat162float(sink[row * ss + head]);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   float const* xr = x + row * sx + source_head * D + col % D;
   float const scale = sigmoid(__fsub_rn(lse[row * sl0 + source_head * sl1], s));
   __nv_bfloat16 const* gh = reinterpret_cast<__nv_bfloat16 const*>(&g);

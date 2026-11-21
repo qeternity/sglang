@@ -162,3 +162,18 @@ SM90/SM100 reference box).
 - FA4-only perf optimizations (sheared bias, head padding) are lost on SM86; attention is
   not the throughput bottleneck at batch 1 (decode is memory-bound on expert weights), so
   this is acceptable.
+
+### Addendum (sauron bring-up, sconv PDL failure)
+
+The first sauron run failed JIT-compiling `inkling2_sconv` for sm_86: ptxas rejected
+`griddepcontrol.wait` / `griddepcontrol.launch_dependents` ("requires .target sm_90 or
+higher"). The six inkling2 csrc files with raw PDL asm — `sconv.cuh`, `prologue.cuh`,
+`routed_quant.cuh`, `route.cuh`, `routed_rows.cuh`, `gate_sink.cuh` — bypassed the
+repo's own guarded helpers and emitted the instructions unconditionally. Fixed by
+replacing every pair with the idiom used everywhere else in the tree
+(`sgl_kernel/utils.cuh`): `PDLWaitPrimary<true>()` / `PDLTriggerSecondary<true>()`,
+which compile to the same asm on sm_90+ and to nothing on sm_8x
+(`#if SGL_ARCH_HOPPER_OR_GREATER` + `if constexpr`). Hopper behavior is bit-identical;
+SM8x just loses the PDL fast path, as intended. Full scan for other sm90-only PTX
+(TMA, mbarrier, clusters, DSMEM) in `csrc/inkling2/`: clean — the only remaining raw asm
+is `mma.sync.aligned.m16n8k16` (sm_75+, safe).

@@ -204,8 +204,8 @@ __global__ void __launch_bounds__(split_threads(K)) quantize_routed(
   static_assert(K % 64 == 0 && kSplit > 1);
   __shared__ int s_offsets[kMaxExperts + 1];
   __shared__ float red[2][kThreads / 32];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   load_offsets(offsets, experts, s_offsets);
   int const block = threadIdx.x / kSplit, part = threadIdx.x % kSplit;
   bool const active = block < K / 16;
@@ -284,8 +284,8 @@ __global__ void __launch_bounds__(split_threads(N)) swiglu_quantize_routed(
   static_assert(N % 64 == 0 && kSplit > 1);
   __shared__ int s_offsets[kMaxExperts + 1];
   __shared__ float red[2][kThreads / 32];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   load_offsets(offsets, experts, s_offsets);
   int const block = threadIdx.x / kSplit, part = threadIdx.x % kSplit;
   bool const active = block < N / 16;
@@ -364,8 +364,8 @@ __global__ void __launch_bounds__(threads(N)) mxfp8_swiglu_quantize_routed(
     float gate_cap,
     float up_cap) {
   static_assert(N % 32 == 0 && N / 16 <= 1024);
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int const block = threadIdx.x;
   bool const active = block < N / 16;
   int const lo = offsets[0], hi = offsets[experts];
@@ -402,8 +402,8 @@ constexpr int kRowParts = 3;
 template <int N>
 __global__ void __launch_bounds__(N / 16 / kRowParts)
     mxfp8_quantize_rows(__nv_bfloat16 const* __restrict__ x, uint8_t* values, uint8_t* exponents, int rows) {
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int const block = (blockIdx.x % kRowParts) * blockDim.x + threadIdx.x;
   for (int row = blockIdx.x / kRowParts; row < rows; row += gridDim.x / kRowParts) {
     float v[16];

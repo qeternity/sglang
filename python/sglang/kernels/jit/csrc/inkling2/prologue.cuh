@@ -215,8 +215,8 @@ __global__ void __launch_bounds__(kThreads) prologue_kernel(Params p) {
                                  ? load2(cache[s] + slot * p.sc0 + int64_t(src - bos + W - 1) * p.sc1 + col)
                                  : make_float2(0.0f, 0.0f);
         }
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
     if constexpr (DYNAMIC) {
       if (t < 2 * kDyn) {
         int const s = t / kDyn, n = t % kDyn;
@@ -331,8 +331,8 @@ __global__ void __launch_bounds__(kThreads) prologue_kernel(Params p) {
       for (int half = 0; half < 2; ++half)
         load8_scale<TS>(p.q_scale, head * kD + half * 64 + l * 8, scale[half]);
     }
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
     if (t < HEADS * 8) {
       bf16 const* x = p.q + int64_t(row) * p.sp + head * kD;
       float v[2][8];
@@ -408,8 +408,8 @@ __global__ void __launch_bounds__(kThreads) prologue_kernel(Params p) {
       lo = top - cnt + 1;
       base8 = cnt > 0 ? lo & ~7 : 0;
     }
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
+    device::PDLWaitPrimary<true>();
+    device::PDLTriggerSecondary<true>();
     float v[8] = {};
     if (real) {
       load8(p.r + int64_t(row) * p.sp + head * kDRel + l * 8, v);
