@@ -1819,6 +1819,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse: bool = False,
     ):
         if (
             k is not None
@@ -1826,6 +1827,7 @@ class TritonAttnBackend(AttentionBackend):
             and sinks is None
             and score_mod is None
             and aux_tensors is None
+            and not return_lse
             and self._can_run_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
         ):
             return self._forward_dense_fp8_chunked_mha(q, k, v, layer, forward_batch)
@@ -1935,12 +1937,20 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton extend does not support score_mod"
                 )
+            if return_lse:
+                raise NotImplementedError(
+                    "DCP Triton extend does not support return_lse"
+                )
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
+            if return_lse:
+                raise NotImplementedError(
+                    "Triton unified (deterministic) extend does not support return_lse"
+                )
             return self._forward_extend_unified(
                 q,
                 o,
@@ -1989,6 +1999,7 @@ class TritonAttnBackend(AttentionBackend):
             and k is not None
             and causal
             and score_mod is None
+            and not return_lse
             and sinks is None
             and sliding_window_size == -1
             # bf16 KV checkpoints may still load unit k/v scales
@@ -2027,6 +2038,7 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
+            and not return_lse
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2057,6 +2069,13 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        lse = None
+        if return_lse:
+            lse = torch.empty(
+                (q.shape[0], layer.tp_q_head_num),
+                dtype=torch.float32,
+                device=q.device,
+            )
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2085,7 +2104,10 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             bf16_dot=self.draft_bf16_dot,
+            lse_extend=lse,
         )
+        if return_lse:
+            return o, lse
         return o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
@@ -2475,6 +2497,7 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        return_lse: bool = False,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -2596,6 +2619,10 @@ class TritonAttnBackend(AttentionBackend):
                 raise NotImplementedError(
                     "DCP Triton decode does not support score_mod"
                 )
+            if return_lse:
+                raise NotImplementedError(
+                    "DCP Triton decode does not support return_lse"
+                )
             group = get_parallel().dcp_group
             with use_symmetric_memory(group):
                 q_for_decode = q.view(
@@ -2641,6 +2668,10 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        if return_lse:
+            self.forward_metadata.attn_lse[: q.shape[0], : layer.tp_q_head_num].fill_(
+                -float("inf")
+            )
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.kv_layers.read(layer.layer_id).key(),
@@ -2670,6 +2701,12 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=self.forward_metadata.lean_locks,
             uneven_batch=self.forward_metadata.uneven_batch,
         )
+        if return_lse:
+            lse = torch.logsumexp(
+                self.forward_metadata.attn_lse[: q.shape[0], : layer.tp_q_head_num],
+                dim=-1,
+            )
+            return o, lse
         return o
 
 

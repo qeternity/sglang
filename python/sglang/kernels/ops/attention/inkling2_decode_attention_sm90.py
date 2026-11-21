@@ -7,6 +7,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
+
 MAX_SPLITS = 64
 
 
@@ -180,6 +182,6 @@ def decode_partials(
         block_n,
         num_warps=4,
         num_stages=2 if qlen == 1 else 3,
-        launch_pdl=True,
+        **({"launch_pdl": True} if is_arch_support_pdl() else {}),
     )
     return o, m, l
