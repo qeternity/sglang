@@ -115,7 +115,7 @@ def qk_l2_clip_fwd(
     output_dtype = output_dtype or x.dtype
     if scale is not None:
         assert scale.is_cuda and scale.device == x.device
-        assert scale.ndim in (1, 2) and scale.contiguous()
+        assert scale.ndim in (1, 2) and scale.is_contiguous()
     if output_scale is not None:
         assert output_scale.is_cuda and output_scale.is_contiguous()
         assert output_scale.dtype == torch.float32 and output_scale.ndim == 1
