@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090 (SM86)
 - **Dependencies:** TICKET-06 (correctness + baseline must be green first)
 - **Estimate:** ~1 wk (high variance — speculative decoding is the least predictable part)
-- **Status:** pending (stretch; out of scope for the initial ship)
+- **Status:** local pre-work done 2026-11-21 (SM-gate absence re-verified; selection arg identified: `--speculative-algorithm dspark`); box work deferred to after T6 is green
 
 ## Context
 
@@ -61,3 +61,24 @@ inherit from T1 (attention) and T3 (AR overlap). The `SGLANG_OPT_DSPARK_*` flags
   the optimum on PCIe-latency ARs may be different — expect an offline tuning pass.
 - This is explicitly stretch: the initial ship is non-speculative. A clean "no-go" with
   measured data is an acceptable outcome.
+## Pre-work log (2026-11-21, local)
+
+- Re-verified: no SM/arch gates anywhere in
+  `speculative/inkling2_mtp_worker.py`, `speculative/dspark_components/*`, or
+  the `spec_info.py` selection path (grep for sm80/90/100/120, capability,
+  get_device_capability — zero hits). The SM86 gaps are exactly the T1/T3
+  inheritance stated in the ticket, nothing more.
+- Selection: `--speculative-algorithm dspark` (the `speculative_algorithm`
+  arg, `SpeculativeAlgorithm.DSPARK`) + an Inkling2 architecture is enough
+  for `spec_info.py` to return `Inkling2MTPWorker` (it checks the arch list
+  `INKLING2_ARCHS`, so both Mini and Small get the Inkling2 worker; plain
+  DSpark models get `DSparkWorkerV2`). Standard speculative args (steps /
+  EAGLE-style knobs) + the `SGLANG_OPT_DSPARK_*` envs are the tuning surface.
+- The DSpark SPS/STS offline fit tools exist in-tree
+  (`python -m sglang.benchmark.dspark_sps_profiler` /
+  `dspark_sts_fit`) — the ticket's "expect an offline tuning pass" is
+  supported by shipped tooling; the fitted tables feed
+  `--speculative-dspark-sps-table-path` /
+  `--speculative-dspark-confidence-sts-path`.
+
+Nothing else is doable without the T6 baseline; box work starts there.
