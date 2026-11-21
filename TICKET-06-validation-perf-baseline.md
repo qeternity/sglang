@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090 (SM86) — sauron is the **only** GPU hardware the operator has; there is no reference box
 - **Dependencies:** TICKET-05
 - **Estimate:** ~1 wk
-- **Status:** pending
+- **Status:** harness implemented locally 2026-11-21 (`t6_validate.py`, smoke-tested against a stub server); the gates themselves run on sauron — this is the go/no-go for the whole effort
 - **Note:** per the operator constraint, no tests were run during the investigation phase;
   this ticket is the **planned** validation harness for the post-implementation phase.
 
@@ -80,3 +80,43 @@ Overhead breakdown to report per scenario:
   aggregate are the hard floors; missing them means a kernel path is not actually on the
   hot path — profile before shipping).
 - Report delivered.
+## Implementation log (2026-11-21, local)
+
+`python t6_validate.py` (repo root) orchestrates the gates against a
+**running** server, reusing the repo's own benchmark/eval tools so the
+harness is one script per section:
+
+- `gsm8k` — `python -m sglang.test.run_eval --eval-name gsm8k
+  --num-examples 200` (auto-downloads the 1319-sample test split;
+  `--gsm8k-data PATH` for offline boxes). The ticket's sgl-eval 0.1.3 is
+  the same protocol (greedy, 200 samples); run_eval is the in-repo
+  equivalent and already greps/grades the boxed answers. Accuracy is
+  parsed from its output (PASS ≥ 92%, WARN ≥ 90%, else FAIL + the raw
+  log in `t6_gsm8k.log`).
+- `determinism` — the same 2048-token greedy prompt twice via
+  `/v1/completions` (token-for-token if the server returns token ids,
+  else exact-text equality); times each run.
+- `prefix` — a ~4 k deterministic shared prefix sent twice; asserts
+  identical output **and** `cached_tokens > 0` on the second request's
+  usage (radix-cache hit through the loop-state machinery).
+- `swa` — the needle test: codeword ZK-7391 at the top of the context,
+  question at +~450 tokens (inside the 1024 sliding window) and at
+  +~2100 (outside it — the full-attention layers must carry the answer).
+  Both must return the codeword.
+- `perf` — `python -m sglang.benchmark.serving` (random dataset,
+  greedy): decode bs1 (128 in / 256 out, concurrency 1) and 8 k prefill
+  (8192 in / 64 out, concurrency 8); parses in/out throughput, TTFT, ITL.
+- Gate 2 (TP1 vs TP2), the memory watermark, and the CUDA-graph
+  follow-up need a server restart / `nvidia-smi`, so the generated
+  `t6_report.md` lists them as explicit manual steps with the exact
+  commands (including the `--only determinism` re-run for the TP1
+  comparison).
+
+Smoke-tested locally against a stub OpenAI-compatible server: all
+sections run, the cached_tokens/needle plumbing parses correctly, the
+report renders, and the exit code reflects the gate verdict.
+
+On sauron (after the T5 recipe command): `python t6_validate.py
+--port 8000 --model <local model dir>`; then the TP1 re-run and the
+nvidia-smi watermark per the report. That output **is** the ticket's
+deliverable (report to the operator + go/no-go for T7).
