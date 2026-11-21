@@ -88,6 +88,9 @@ class QKL2Clip(nn.Module):
         self.threshold = threshold
         self.eps = eps
         self.tp_rank = tp_rank
+        # Ampere (SM8x): the CUTE-DSL clip targets SM90+; the triton port is
+        # term-for-term (inkling2_norm_triton.qk_l2_clip_fwd).
+        self._use_triton = get_platform().is_sm80
         if learnable_scale:
             self.scale = nn.Parameter(torch.empty(num_heads, dim), requires_grad=False)
             set_weight_attrs(self.scale, {"weight_loader": self.weight_loader})
@@ -103,13 +106,18 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
-        from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
-            qk_l2_clip_fwd_cutedsl,
-        )
+        if self._use_triton:
+            from sglang.kernels.ops.layernorm.inkling2_norm_triton import (
+                qk_l2_clip_fwd,
+            )
+        else:
+            from sglang.kernels.ops.layernorm.inkling2_qk_l2_clip import (
+                qk_l2_clip_fwd_cutedsl,
+            )
 
-        output = qk_l2_clip_fwd_cutedsl(
-            x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
-        )
+        output = (
+            qk_l2_clip_fwd if self._use_triton else qk_l2_clip_fwd_cutedsl
+        )(x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale)
         return output.view(x.shape)
 
 

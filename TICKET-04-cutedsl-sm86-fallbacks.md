@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090 (SM86)
 - **Dependencies:** TICKET-00 (needs the model to import; the kernels themselves can be probed standalone)
 - **Estimate:** 1–3 days
-- **Status:** pending
+- **Status:** implemented locally 2026-11-21 (term-for-term triton ports + arch dispatch + CPU tests; GPU parity probe `t4_norm_validate.py` pending on sauron with T5/T6; CUTE-DSL-on-SM86 probe folded into that script, section D)
 
 ## Problem
 
@@ -56,3 +56,55 @@ assumption lives in the CUDA code, not in a Python check.
 - If the installed `nvidia-cutlass-dsl` *silently* compiles for the wrong arch (shouldn't
   happen — the DSL validates arch at build time), the parity test on SM90 catches regressions
   in the other direction.
+## Implementation log (2026-11-21, local; sauron validation pending)
+
+Approach: capability-based dispatch (SM8x → triton, everything else →
+CUTE-DSL untouched), with the triton implementations in a **new module that
+does not import cutlass** — a 3090 box may not have `nvidia-cutlass-dsl`
+installed, and the CUTE-DSL modules have hard `import cutlass` at module top.
+So the arch decision lives in the model's two forward methods (both already
+lazily import the kernel), and the triton path never touches cutlass.
+
+New: `python/sglang/kernels/ops/layernorm/inkling2_norm_triton.py`
+- `qk_l2_clip_fwd(x, threshold, eps, *, output_dtype, scale, output_scale)` —
+  term-for-term port of `inkling2_cute_utils.qk_l2_clip_row_stats`:
+  x→fp32, per-head scale `scale[row % H, :]*` first (if present; rank-1
+  scales fold to (1, N) so `row % 1 == 0` loads the per-column value,
+  matching the cutedsl rank-1 branch), `sum_sq = Σx²`,
+  `norm = sum_sq * rsqrt(sum_sq)` (0 when sum_sq == 0 — exactly as the
+  cutedsl kernel), `coeff = min(1, threshold / (norm + eps))`, `y = x*coeff`,
+  and the output_scale double-rounding
+  `(y → out_dtype → fp32) * out_scale[row // k]` preserved.
+- `rms_norm(x, weight, eps, *, pre_weight, output_dtype, out)` — port of
+  `rmsnorm_row_rstd`: x→fp32, `* pre_weight` first (if present),
+  `rstd = rsqrt(Σx²/N + eps)`, `y = x*rstd*weight`, store as out_dtype.
+  The `out=` contract (preallocated buffer) is kept.
+- One program per row, masked BLOCK = next_pow2(N); fp32 accumulation;
+  triton's `rsqrt` compiles to the same CUDA intrinsic as the cutedsl one.
+
+Model dispatch (2 lines each, decision cached in `__init__`):
+- `inkling2_norm.py::RMSNorm` — `self._use_triton = get_platform().is_sm80`
+  (the T2 probe, lru_cached); forward picks `inkling2_norm_triton.rms_norm`
+  on SM8x, `inkling2_rms_norm.rms_norm` (CUTE-DSL) otherwise.
+- `inkling2_attn.py::QKL2Clip` — same pattern for
+  `qk_l2_clip_fwd` vs `qk_l2_clip_fwd_cutedsl`. All three model instances
+  (q/k/rel clips) go through this one forward.
+
+Scope note: SM120 (consumer Blackwell) is deliberately **out** — `is_sm80`
+is False there, so it keeps today's CUTE-DSL behavior exactly as on all
+non-Ampere boxes; whether cutlass-dsl targets sm_120 is a separate ticket.
+
+Tests: `test/registered/unit/models/test_inkling2_norm_triton_dispatch.py`
+(10 CPU tests, `base-a-test-cpu`: subprocess import with `cutlass` absent,
+dispatch table {sm80/sm90/sm120} × {RMSNorm, QKL2Clip}, no-scale variant).
+Regression: 226 passed / 6 skipped across the five inkling2 suites +
+model_overrides; ruff clean.
+
+GPU validation (sauron, next deploy): `t4_norm_validate.py` — sections
+A/B run the triton kernels vs the pure-torch reference over
+{M=1,7,257}×{N=16,128,2304} with all scale/pre_weight/out combinations
+(including the 3D (T,H,N) layout the model feeds); C runs the real model
+modules and asserts they auto-selected the triton path on the box; D is the
+ticket's "probe the CUTE-DSL kernels on the 3090 and record verbatim" step
+(success or failure both fine — the dispatch already routes around it).
+PASS bar: bf16-noise parity + auto-dispatch.
