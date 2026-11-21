@@ -92,6 +92,7 @@ class _P2PAllReduce:
             self.state,
             self.rank,
             self.world,
+            is_arch_support_pdl(),
             num_warps=1,
             **({"launch_pdl": True} if is_arch_support_pdl() else {}),
         )
@@ -468,9 +469,10 @@ def prepare_routed_exchange(group, max_rows, hidden):
 
 
 @triton.jit
-def _peer_barrier(FlagPtrs, State, rank, WORLD: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+def _peer_barrier(FlagPtrs, State, rank, WORLD: tl.constexpr, USE_PDL: tl.constexpr):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     epoch = tl.load(State) + 1
     tl.store(State, epoch)
     for peer in tl.static_range(WORLD):
@@ -511,9 +513,11 @@ def _prefill_exchange_combine(
     CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
     THREADS: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     item = tl.program_id(0)
     src = rank * per_rank + item // CHUNKS
     if src >= tokens:
@@ -566,8 +570,9 @@ class PrefillExchange:
             self.state,
             self.rank,
             self.world,
+            is_arch_support_pdl(),
             num_warps=1,
-            launch_pdl=True,
+            **({"launch_pdl": True} if is_arch_support_pdl() else {}),
         )
 
     def per_rank(self, tokens):
@@ -591,8 +596,9 @@ class PrefillExchange:
             chunks,
             512,
             128,
+            is_arch_support_pdl(),
             num_warps=4,
-            launch_pdl=True,
+            **({"launch_pdl": True} if is_arch_support_pdl() else {}),
         )
         self.barrier()
         return self.out[: tokens * self.hidden].view(tokens, self.hidden)
