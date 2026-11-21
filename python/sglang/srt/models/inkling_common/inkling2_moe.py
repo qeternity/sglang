@@ -289,10 +289,13 @@ class Inkling2Experts(nn.Module):
                 or all(w.shape[2] % 128 == 0 for w in (self.w13_weight, self.w2_weight))
             )
         )
-        # SM90 lacks block-scaled MMA, and the SM100 kernels need tcgen05: other
-        # SM90 and SM120 experts run through Marlin.
-        self.use_marlin = platform.is_sm90 or (
-            platform.is_sm120 and not self.native_sm120
+        # SM8x and SM90 lack block-scaled MMA and the SM100 kernels need
+        # tcgen05: SM8x, SM90 and SM120 experts run through Marlin's weight-only
+        # dequant + BF16 MMA, which is arch-generic from SM80 up.
+        self.use_marlin = (
+            platform.is_sm90
+            or platform.is_sm80
+            or (platform.is_sm120 and not self.native_sm120)
         )
 
     def _empty_weight(self, shape, dtype):

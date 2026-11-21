@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090 (SM86, TP2/EP2)
 - **Dependencies:** TICKET-00
 - **Estimate:** 1–2 wks
-- **Status:** pending
+- **Status:** implemented locally 2026-11-21 (dispatch + CPU tests; first 3090 JIT build + load pending on sauron)
 
 ## Problem
 
@@ -84,6 +84,56 @@ reference.
 - `Inkling-2-Mini` weight load completes on 2×3090 TP2/EP2 (~10.7 GB weights per GPU).
 - Unit tests pass (registered in the base-a CPU/CUDA suites like the existing `test_inkling2.py`
   registrations).
+
+## Implementation log (2026-11-21)
+
+Step 1 is done, and it was smaller than the ticket assumed: the dispatch is a
+single condition, and every downstream hook already gates on it.
+
+- `runtime_context.py`: registered the `is_sm80` platform fact
+  (`"is_sm80": "is_sm80_supported"` in `_PLATFORM_PROBES`). The existing
+  `is_sm80_supported()` probe (`srt/utils/device.py:343`) matches the whole
+  SM8x family (major == 8, CUDA >= 11) — SM80/86/89 — which is exactly the
+  set that lacks FP8/FP4 tensor cores and must run weight-only dequant +
+  BF16 MMA.
+- `inkling2_moe.py`: `self.use_marlin = platform.is_sm90 or platform.is_sm80
+  or (platform.is_sm120 and not self.native_sm120)`.
+
+Everything else follows automatically from `use_marlin` — verified by reading
+each hook, no extra changes needed:
+
+- `prepare_routed_exchange` (`inkling2_moe.py:~340`): early-returns for
+  `ep_size == 1 or use_marlin` — the EP token exchange (the CUTLASS/MegaMoE
+  path) is skipped on SM86; the Marlin combine at the end of forward
+  (oneshot all-reduce + `source_partial`) is the one that runs.
+- `prepare_mxfp8_cutlass_scales`: gated on `not self.use_marlin` — skipped.
+- `swizzle_nvfp4_scales`: branches `native_sm120` → Marlin repack →
+  capability guard; with `use_marlin` set it takes the Marlin repack branch
+  (`marlin_sm90.repack` / `repack_mxfp8`) and never reaches the SM100/103/107
+  hard error.
+- The Marlin kernel stack is arch-neutral: `moe_wna16_marlin` loads through
+  the generic `load_jit` (arch auto-detected; the only CUDA gate in
+  `moe_wna16_marlin.cuh` is `__CUDA_ARCH__ < 800`), and the NVFP4/MXFP8
+  dequant + activation fake-quant are pure-Triton emulation
+  (`inkling2_experts_sm90.py`, `inkling2_moe.py::_mxfp8_block`) with no
+  `cp.async`/TMA/FP8-specific instructions.
+
+The SM86 combine uses the same `multicast_combine` branch as SM90
+(`inkling2_moe.py:~799`, `oneshot_all_reduce_input` + `multicast_all_reduce`).
+On sauron (no NVLink, `multicast_ptr == 0`) that call is exactly what
+TICKET-03 replaces with the size-dispatched P2P/NCCL path — the tickets
+compose; T2 alone will still raise there by design until T3 lands.
+
+Tests: `test/registered/unit/models/test_inkling2_moe_marlin_dispatch.py`
+(4 CPU cases, `base-a-test-cpu`): builds a real `Inkling2Experts`
+(bf16, 4 experts) with `override_platform` + the parallel context stamped to
+TP1/EP1, and checks `use_marlin` for (SM8x→True new), (SM90→True existing),
+(all off →False, SM100 native CUTLASS), and (SM8x+SM120 → True, short-circuit).
+All pass; the full T0/T1 CPU regression (204 tests) stays green.
+
+Remaining (sauron, with T5): first JIT build of `moe_wna16_marlin` for sm_86
+(both variants), NVFP4 + MXFP8 load-time repack, the GEMV branch at batch 1,
+and the numerical spot-check against the bf16 reference.
 
 ## Risks
 
