@@ -55,7 +55,11 @@ class LoopMessageBank:
         weights: tuple[torch.Tensor, ...],
         side: Literal["attn", "mlp"],
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+        from sglang.srt.models.inkling_common.inkling2_attn_res import (
+            _attn_res_kernel,
+        )
+
+        attn_res = _attn_res_kernel()
 
         rows = _SIDE_ROWS[side]
         messages = attn_res(

@@ -1,7 +1,19 @@
 import msgspec
 import torch
+from sglang.srt.runtime_context import get_platform
 from torch import nn
 
+
+def _attn_res_kernel():
+    """The attn_res kernel for this device: the cutedsl kernel is sm_90+ only
+    (TMA pipelines, mbarriers, elect_one); SM8x takes the cutlass-free triton
+    port, which is safe on boxes without nvidia-cutlass-dsl installed."""
+    if get_platform().is_sm80:
+        from sglang.kernels.ops.attention.inkling2_attn_res_triton import attn_res
+    else:
+        from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+
+    return attn_res
 
 def block_attn_res(
     blocks: list[torch.Tensor],
@@ -28,7 +40,7 @@ def block_attn_res(
         if scaled_queries is not None
         else queries.float() * (hidden_size**-0.5)
     )
-    from sglang.kernels.ops.attention.inkling2_attn_res import attn_res
+    attn_res = _attn_res_kernel()
 
     return attn_res(
         [x.contiguous() for x in sources],

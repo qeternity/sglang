@@ -83,3 +83,51 @@ def test_qk_l2_clip_dispatch_no_scale():
         )
         assert clip._use_triton is True
         assert clip.scale is None
+
+# --- attn_res (attention-residual combine) dispatch ----------------------
+
+
+def test_attn_res_triton_module_imports_without_cutlass():
+    code = (
+        "import sys; "
+        "import sglang.kernels.ops.attention.inkling2_attn_res_triton as m; "
+        "assert 'cutlass' not in sys.modules, 'triton fallback must not pull in CUTE-DSL'; "
+        "assert hasattr(m, 'attn_res')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def test_attn_res_dispatch_sm8x():
+    from sglang.srt.models.inkling_common.inkling2_attn_res import _attn_res_kernel
+
+    with override_platform(is_sm80=True, is_sm90=False, is_sm120=False):
+        fn = _attn_res_kernel()
+    assert fn.__module__ == "sglang.kernels.ops.attention.inkling2_attn_res_triton"
+
+
+def test_attn_res_dispatch_non_sm8x():
+    import types
+
+    from sglang.srt.models.inkling_common.inkling2_attn_res import _attn_res_kernel
+
+    stub = types.ModuleType("sglang.kernels.ops.attention.inkling2_attn_res")
+    stub.attn_res = lambda *a, **k: None
+    name = "sglang.kernels.ops.attention.inkling2_attn_res"
+    saved = sys.modules.get(name)
+    sys.modules[name] = stub
+    try:
+        with override_platform(is_sm80=False, is_sm90=True, is_sm120=False):
+            fn = _attn_res_kernel()
+        assert fn is stub.attn_res
+    finally:
+        if saved is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = saved

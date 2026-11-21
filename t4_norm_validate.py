@@ -55,6 +55,30 @@ def ref_qk_l2_clip(
     return y.to(output_dtype)
 
 
+def ref_attn_res(blocks, addend, queries, normalize, eps=1e-6):
+    """Pure-torch attn_res: per token, per query, over the sources n:
+    x_n (+ addend for the last source), rms_inv = rsqrt(mean(x^2) + eps),
+    logit = dot(x, q) * rms_inv, softmax over n, weighted combine (x or
+    x * rms_inv depending on normalize)."""
+    t, d = blocks[0].shape
+    n = len(blocks)
+    out = torch.empty(
+        queries.shape[0], t, d, device=blocks[0].device, dtype=torch.float32
+    )
+    for qi in range(queries.shape[0]):
+        q = queries[qi].float()
+        logits, vals = [], []
+        for i in range(n):
+            x = blocks[i].float()
+            if addend is not None and i == n - 1:
+                x = x + addend.float()
+            rms_inv = torch.rsqrt(x.square().sum(-1) / d + eps)
+            logits.append((x * q).sum(-1) * rms_inv)
+            vals.append(x * (rms_inv[:, None] if normalize else 1.0))
+        w = torch.softmax(torch.stack(logits, 0), 0)
+        out[qi] = torch.einsum("nt,ntd->td", w, torch.stack(vals, 0))
+    return out
+
 def check(name, got, ref, rtol=2e-2, atol=2e-2):
     got, ref = got.float(), ref.float()
     exact = (got == ref).float().mean().item()
@@ -166,6 +190,46 @@ def main():
             scale=torch.ones(8, 128, device=DEVICE, dtype=torch.bfloat16),
         ).view(7, 8, 128),
     )
+
+    print("\n== C2. triton attn_res vs torch reference (SM86 loop combine) ==")
+    from sglang.kernels.ops.attention.inkling2_attn_res_triton import (
+        attn_res as attn_res_triton,
+    )
+    from sglang.srt.models.inkling_common.inkling2_attn_res import _attn_res_kernel
+
+    resolved = _attn_res_kernel()
+    print(f"  _attn_res_kernel() -> {resolved.__module__}")
+    all_ok &= resolved.__module__ == "sglang.kernels.ops.attention.inkling2_attn_res_triton"
+    for d in (128, 2304):
+        for n_src in (1, 3, 5):
+            for t in (1, 7):
+                for nq in (1, 3):
+                    for use_addend in (False, True):
+                        for normalize in (False, True):
+                            blocks = [
+                                torch.randn(t, d, device=DEVICE, dtype=torch.bfloat16)
+                                * 3
+                                for _ in range(n_src)
+                            ]
+                            addend = (
+                                torch.randn(t, d, device=DEVICE, dtype=torch.bfloat16)
+                                * 3
+                                if use_addend
+                                else None
+                            )
+                            q = torch.randn(nq, d, device=DEVICE, dtype=torch.float32)
+                            got = attn_res_triton(
+                                blocks, addend, q, normalize_values=normalize
+                            )
+                            ref = ref_attn_res(blocks, addend, q, normalize)
+                            label = (
+                                f"attn_res t={t} d={d} n={n_src} nq={nq} "
+                                f"addend={use_addend} norm={normalize}"
+                            )
+                            for i in range(nq):
+                                all_ok &= check(
+                                    f"{label}[{i}]", got[i], ref[i], rtol=5e-2, atol=5e-2
+                                )
 
     print("\n== D. CUTE-DSL probe on SM86 (failure expected and fine) ==")
     for label, fn in (

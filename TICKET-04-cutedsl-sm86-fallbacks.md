@@ -108,3 +108,21 @@ modules and asserts they auto-selected the triton path on the box; D is the
 ticket's "probe the CUTE-DSL kernels on the 3090 and record verbatim" step
 (success or failure both fine — the dispatch already routes around it).
 PASS bar: bf16-noise parity + auto-dispatch.
+
+### Addendum (sauron bring-up, attn_res)
+
+Sauron's first full forward reached the attention-residual combine and failed:
+`inkling2_attn_res.AttnResFwdKernel` is CUTE-DSL with TMA pipelines, mbarriers,
+and `elect_one` — all sm_90+ — and the ticket's original scope (qk_l2_clip +
+rms_norm) missed it. Ported term-for-term to triton in
+`kernels/ops/attention/inkling2_attn_res_triton.py` (cutlass-free; sources
+addressed through a base pointer + int64 element-offset table, like the cutedsl
+entry, so no staging copy): per token/query, x_n = block_n (+ addend on the
+last source), rms_inv = rsqrt(mean(x^2) + 1e-6), logit = dot(x, q) * rms_inv,
+softmax over sources, weighted combine of x (or x * rms_inv when
+normalize_values, which the loop models require). Dispatch in a new
+`_attn_res_kernel()` helper used by BOTH call sites (`block_attn_res` and
+`LoopMessageBank.mix` — the latter was a second, previously unnoticed cute
+import). t4 probe gained section C2 (triton vs pure-torch reference across
+t/d/n/nq/addend/normalize, incl. D=2304); CPU dispatch tests added
+(13 total in the dispatch file).
