@@ -1,3 +1,4 @@
+import logging
 from array import array
 from collections.abc import Iterable
 
@@ -271,6 +272,48 @@ class Inkling2LogitsProcessor(LogitsProcessor):
         return logits
 
 
+logger = logging.getLogger(__name__)
+
+
+def _layer_ids(tensor_names: Iterable[str]) -> list[int]:
+    """Physical layer ids present in a set of tensor names."""
+    ids = set()
+    for name in tensor_names:
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                ids.add(int(parts[i + 1]))
+    return sorted(ids)
+
+
+def _log_startup_summary(config: Inkling2ModelConfig, quant_config) -> None:
+    """One startup line with the TP/EP shape and the per-layer precision
+    assignment (TICKET-05)."""
+    parallel = get_parallel()
+    parts = [
+        (
+            "Inkling2 startup: "
+            f"attn_tp={parallel.attn_tp_size} moe_tp={parallel.moe_tp_size} "
+            f"moe_ep={parallel.moe_ep_size}, {config.num_hidden_layers} layers"
+        )
+    ]
+    if getattr(config, "loop_config", None) is not None:
+        parts[0] += f" ({config.num_layer_visits} visits)"
+    experts = getattr(config, "n_routed_experts", 0)
+    if experts:
+        ep = max(1, parallel.moe_ep_size)
+        parts.append(f"{experts} experts ({experts // ep} per rank)")
+    if quant_config is not None:
+        for label, names in (
+            ("NVFP4", quant_config.nvfp4_weights),
+            ("MXFP8", quant_config.mxfp8_weights),
+        ):
+            ids = _layer_ids(names)
+            if ids:
+                parts.append(f"{label} layers {ids[0]}-{ids[-1]}")
+    logger.info(" ".join(parts))
+
+
 class Inkling2CausalLLM(nn.Module):
     def __init__(self, config: Inkling2ModelConfig, quant_config, prefix):
         super().__init__()
@@ -292,6 +335,7 @@ class Inkling2CausalLLM(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        _log_startup_summary(config, quant_config)
         self.attn_res = Inkling2AttnRes(
             config.num_hidden_layers,
             config.hidden_size,

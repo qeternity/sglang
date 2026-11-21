@@ -4,7 +4,7 @@
 - **Hardware target:** 2× RTX 3090 (SM86, 48 GB total)
 - **Dependencies:** TICKET-01, TICKET-02, TICKET-03, TICKET-04
 - **Estimate:** 2–3 days
-- **Status:** pending
+- **Status:** implemented locally 2026-11-21 (SM8x fa4 fail-fast, startup + collectives-mode logs; full-server validation pending on sauron with T6)
 
 ## Scope
 
@@ -100,3 +100,57 @@ Differences from the H200 recipe and why:
 - Low. This is glue + validation; the real work is in T1–T4. Main risk is a server-args
   validation that currently *requires* fa4 at a level above the model (checked in T1; if the
   validation is in `server_args.py`/registry, fix there instead).
+## Implementation log (2026-11-21, local; full-server run pending on sauron)
+
+Three small code changes; everything else in this ticket is recipe/T6 work.
+
+1. **FA4 on SM8x fails fast** — `Inkling2Attention.__init__` (covers both
+   the loop and non-loop models) now checks, only on `is_sm80` devices
+   (the T2 platform probe — the check is skipped entirely on every other
+   arch, so zero cost/no new runtime-context reads on Hopper/Blackwell):
+   the configured `(prefill, decode)` backend pair from
+   `runtime_context.attention_backends()`; if either is `fa4`, raise
+   `RuntimeError` naming the fix (`--attention-backend triton` +
+   `--kv-cache-dtype bfloat16`). There is **no server-args-level fa4
+   requirement** in the repo (verified: the only fa4 checks are the
+   model-level asserts, which T1 already extended to accept `triton`),
+   so this model-level guard is the only place needed. The ticket's
+   "auto-select triton" step was deliberately *not* implemented: silently
+   swapping a user-specified backend hides configuration; the acceptance
+   criteria ask for a fail-fast, which is what ships.
+2. **Startup summary line** — one `logger.info` in
+   `Inkling2CausalLLM.__init__` (after the layers are built):
+   `Inkling2 startup: attn_tp=2 moe_tp=2 moe_ep=2, 24 layers (48 visits)
+   128 experts (64 per rank) NVFP4 layers 0-19 MXFP8 layers 20-23`.
+   The per-layer precision split is derived from the
+   `Inkling2QuantConfig` tensor-name sets (`nvfp4_weights`/
+   `mxfp8_weights` → `layers.<i>` ids); the non-loop config (no
+   `loop_config`) prints the 48-layer line without visits. Verified with
+   the exact Mini shape: line renders as above.
+3. **Collectives mode line** (T3 integration) — `inkling2_comm.has_multicast`
+   now logs once per group when the multicast probe first resolves:
+   `Inkling2 collectives [<group>]: multimem (multicast) one-shot
+   all-reduce` on NVLink boxes, or `... P2P-read one-shot all-reduce for
+   payloads <= 256 KB, NCCL above that (no multicast on this link)` on
+   the 3090. This is the startup line the T3 ticket asked for.
+
+Verified locally: 226 tests pass (T0+T1+T2+T3+T4 suites + overrides),
+ruff clean on all touched files (the two pre-existing import-order
+findings in the upstream model files are left alone — they predate this
+branch's local ruff version and reordering 40 upstream import lines is
+diff noise).
+
+Remaining (sauron, with T6): run the reference command from §1, confirm
+the three log lines, and the memory watermark. Loop flags
+(`--inkling2-loop-num-passes`, `--inkling2-loop-share-cache`) and the
+`xgrammar`/`bf16-gemm-backend torch` flags already exist in the arg
+surface (verified in `arg_groups/fields/model.py`); no new flags were
+added.
+
+Scope decision (ticket §4): image inputs on SM86 keep the existing hard
+gate in `inkling2_vision.py` ("Inkling2 vision attention requires Hopper
+or Blackwell"). Degrading multimodal prompts to text by dropping the
+vision embeddings would silently corrupt the output (the prompt's
+placeholder tokens would be answered without their content), which is
+worse than an explicit error at encode time. The recipe therefore
+documents text-only scope; no image-dropping filter was added.

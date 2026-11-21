@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 import triton
@@ -10,6 +12,8 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
+
+logger = logging.getLogger(__name__)
 
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
 
@@ -126,12 +130,26 @@ def _multicast_probe(group_name, device):
     return symm_mem.rendezvous(buffer, group_name).multicast_ptr
 
 
+_multicast_logged: set[str] = set()
+
+
 def has_multicast(group) -> bool:
     """Whether the group's symmetric memory has a multicast (multimem) pointer —
     an NVLink hardware feature. PCIe P2P boxes (patched 3090 drivers) map peers
     but cannot multicast; on those the collectives below dispatch to the P2P
     read path or NCCL instead of the multimem kernels."""
-    return bool(_multicast_probe(group.device_group.group_name, _device()))
+    group_name = group.device_group.group_name
+    multicast = bool(_multicast_probe(group_name, _device()))
+    if group_name not in _multicast_logged:
+        _multicast_logged.add(group_name)
+        mode = (
+            "multimem (multicast) one-shot all-reduce"
+            if multicast
+            else "P2P-read one-shot all-reduce for payloads <= "
+            f"{P2P_MAX_BYTES // 1024} KB, NCCL above that (no multicast on this link)"
+        )
+        logger.info("Inkling2 collectives [%s]: %s", group_name, mode)
+    return multicast
 
 
 def _device():

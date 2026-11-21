@@ -36,7 +36,12 @@ from sglang.srt.models.inkling_common.attn import (
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_model,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
@@ -124,6 +129,17 @@ class QKL2Clip(nn.Module):
 class Inkling2Attention(nn.Module):
     def __init__(self, config, layer_id, is_local, prefix=""):
         super().__init__()
+        # Fail fast on Ampere: the FA4 (CUTE-DSL) backend has no SM8x build;
+        # without this the first forward dies deep in the JIT with an opaque
+        # cutlass error (TICKET-05).
+        if get_platform().is_sm80:
+            prefill_backend, decode_backend = attention_backends()
+            if "fa4" in (prefill_backend, decode_backend):
+                raise RuntimeError(
+                    "Inkling2 attention backend 'fa4' is not available on this "
+                    "device (Ampere/SM8x). Re-run with --attention-backend triton "
+                    "and --kv-cache-dtype bfloat16."
+                )
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
         self.hidden_size = config.hidden_size
