@@ -23,6 +23,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 
 @triton.jit
 def _attn_res_fwd(
@@ -162,4 +164,10 @@ def attn_res(
         block,
         num_warps=8 if block >= 4096 else 4,
     )
+    if (
+        envs.SGLANG_DEBUG_SYNC_INKLING2.get()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        # Diagnostic: attribute an async fault to this kernel launch.
+        torch.cuda.synchronize()
     return tuple(output.unbind(0))

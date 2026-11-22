@@ -190,3 +190,26 @@ triton backend supports decode graph replay, and the in-graph tensor-parallel
 ARs take the capture-time NCCL fallback added in the T3 addendum-6 commit
 (the banked P2P path is eager-only). An explicit --cuda-graph-backend-prefill
 / --disable-prefill-cuda-graph still wins (unchanged).
+
+## Addendum 2: diagnosing the async IMA during decode-capture warmups
+
+With prefill graphs disabled, decode capture crashed later at an unrelated
+CUDA call (the extend kernel's first module load surfacing a sticky
+CUDA_ERROR_ILLEGAL_ADDRESS). That load proves the extend kernel had never
+launched in the process, so the faulting kernel executed during the decode
+capture's fake-batch warmup forwards (the only executing phase before the
+first prefill). The CUDASymmetricMemory ~AllocationRef trace is teardown
+noise: the P2P state buffers' destructor rethrowing the sticky error at
+interpreter shutdown.
+
+Diagnostic levers added (one pull covers both routes):
+- SGLANG_DEBUG_SYNC_INKLING2=1 — torch.cuda.synchronize() after every P2P
+  rank-sum and attn_res launch (skipped during capture, where syncs are
+  illegal), so an async fault surfaces at the Python launch site that
+  caused it.
+- Boot with CUDA_LAUNCH_BLOCKING=1 to make every launch synchronous; the
+  traceback then names the faulting kernel directly (if capture rejects
+  blocking mode, fall back to the sync-probe boot).
+- Boot with SGLANG_OPT_INKLING2_P2P_MAX_BYTES=0 to remove the P2P kernels
+  from the warmup path entirely; clean run there points at the captured
+  decode kernels, not the P2P path.

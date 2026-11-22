@@ -2338,6 +2338,11 @@ class Envs:
     # (direct peer reads over symmetric memory); larger payloads go through
     # NCCL. Set 0 to disable the P2P path entirely (diagnostic).
     SGLANG_OPT_INKLING2_P2P_MAX_BYTES = EnvInt(256 * 1024)
+    # Diagnostic: synchronize after every inkling2 triton kernel launch
+    # (P2P all-reduce, attn_res) so an async CUDA fault surfaces at the
+    # Python launch site that caused it instead of at a later, unrelated
+    # CUDA call. Skipped during graph capture (syncs are illegal there).
+    SGLANG_DEBUG_SYNC_INKLING2 = EnvBool(False)
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================

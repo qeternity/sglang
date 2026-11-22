@@ -116,6 +116,14 @@ class _P2PAllReduce:
             enable_fp_fusion=False,
         )
         self.bank = 1 - self.bank
+        self.bank = 1 - self.bank
+        if (
+            envs.SGLANG_DEBUG_SYNC_INKLING2.get()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Diagnostic: surface an async fault HERE (this kernel) instead of
+            # at some later, unrelated CUDA call.
+            torch.cuda.synchronize()
         return self.out[:n]
 
 
