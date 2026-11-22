@@ -46,8 +46,9 @@ def _e4m3_round(x):
     e4m3fn grid (ties to even, saturating at 448) and return it in fp32.
     Triton has no fp8e4nv cast below sm89, but every e4m3fn value is exact in
     fp32 and each op here is exact, so this is bit-identical to the hardware
-    cast (validated against torch's e4m3fn cast on 18M adversarial values,
-    including all grid points and all ties)."""
+    cast. An exact torch mirror of these bit ops matches torch's e4m3fn cast
+    on 6M adversarial values (grid points, ties, denormals, bit patterns);
+    t4_norm_validate.py section E re-checks the triton kernel on the box."""
     is_nan = x != x  # noqa: PLR0124 - NaN check
     a = tl.where(is_nan, 0.0, tl.abs(x))
     # Saturation: the midpoint between 448 (1.75 * 2^8) and 512 (2^9) is 480.
@@ -68,7 +69,7 @@ def _e4m3_round(x):
     # r * 2^(e-3) in bits: r = 8 + m3; r == 16 carries to the next binade.
     carry = r >> 4
     m3 = r & 7
-    norm = (((124 + e + carry) << 23) | (m3 << 20)).to(tl.float32, bitcast=True)
+    norm = (((127 + e + carry) << 23) | (m3 << 20)).to(tl.float32, bitcast=True)
     out = tl.where(a < 2.0**-6, sub, norm)
     out = tl.where(is_nan, float("nan"), out)
     return tl.where(x < 0.0, -out, out)

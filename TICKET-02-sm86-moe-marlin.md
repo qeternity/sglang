@@ -206,3 +206,19 @@ Post-boot warning `Value 140 exceeds the maximum bitwidth (32) for type
 140-bit shift of an int32 is undefined behavior in triton (the CPU torch
 validation had passed only because C++ left the UB unmasked). Replaced with
 the trivially exact `m.to(tl.float32) * 2.0**-9` (m <= 8, power of two).
+
+### Addendum 5 (sauron bring-up, e4m3 normal-path exponent was 124 not 127)
+
+t4 section E (first successful GPU run of the e4m3 check) showed every
+result exactly 8x too small (447 -> 56, 117.15 -> 15, 2^-6 -> 2^-9).
+The normal-path bit construction used exponent field `124 + e + carry`
+where it must be `127 + e + carry`: the rounded significand r = 8 + m3
+(+carry) represents (1 + m3/8) * 2^(e + carry), whose fp32 exponent
+field is 127 + e + carry. The earlier "18M validation" had exercised a
+separate torch mirror, not this bit trick, so the port bug shipped.
+Fixed to 127; an exact torch mirror of the kernel's bit ops now matches
+torch's e4m3fn cast on 6M adversarial values (grid points, ties,
+denormals, random bit patterns, pipeline-shaped values) with 0 mismatches.
+Note this bug corrupts MoE activation fake-quant scales by a factor of 8
+in the 124 version — the server output was doubly wrong (norm bug + this)
+until the norm fix landed.
