@@ -90,7 +90,10 @@ def _source_offsets(blocks: list[torch.Tensor]) -> torch.Tensor:
     tuple. The blocks are the model's static message-bank views, so their
     data_ptrs are stable across steps and across graph replays; a per-call
     torch.tensor(..., device=...) H2D copy here would be both un-capturable
-    (unpinned) and a host-race with the pinned allocator on SM8x decode."""
+    (unpinned) and a host-race with the pinned allocator on SM8x decode.
+    The cache entry is built with torch.empty + per-element scalar fills
+    (fill kernels with baked scalar args: no CPU tensor copy at all, so
+    even a cache miss that first happens inside a graph capture is safe)."""
     base = blocks[0]
     key = (
         tuple(block.data_ptr() for block in blocks),
@@ -100,11 +103,14 @@ def _source_offsets(blocks: list[torch.Tensor]) -> torch.Tensor:
     cached = _OFFSETS_CACHE.get(key)
     if cached is None:
         base_ptr = base.data_ptr()
-        cached = torch.tensor(
-            [(block.data_ptr() - base_ptr) // base.element_size() for block in blocks],
-            dtype=torch.int64,
-            device=base.device,
-        )
+        values = [
+            (block.data_ptr() - base_ptr) // base.element_size() for block in blocks
+        ]
+        cached = torch.empty(len(values), dtype=torch.int64, device=base.device)
+        for i, value in enumerate(values):
+            # explicit narrow+fill_: a scalar fill kernel (baked scalar
+            # argument), never a CPU-tensor copy
+            cached.narrow(0, i, 1).fill_(int(value))
         _OFFSETS_CACHE[key] = cached
     return cached
 
