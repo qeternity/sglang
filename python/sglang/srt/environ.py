@@ -2334,7 +2334,10 @@ class Envs:
     # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
     # for the tokens this rank dispatches.
     SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
-
+    # Inkling2 P2P one-shot all-reduce handles payloads up to this many bytes
+    # (direct peer reads over symmetric memory); larger payloads go through
+    # NCCL. Set 0 to disable the P2P path entirely (diagnostic).
+    SGLANG_OPT_INKLING2_P2P_MAX_BYTES = EnvInt(256 * 1024)
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
     # ===================================================================

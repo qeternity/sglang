@@ -198,3 +198,11 @@ and the one consumer that needs real e4m3 bytes (the Hopper-only
 numerics unchanged (same cast, same point in the pipeline). GPU check
 added as section E of `t4_norm_validate.py` (triton `_e4m3_round` vs torch
 e4m3fn cast on the box).
+
+### Addendum 4 (sauron bring-up, e4m3 subnormal shift was UB)
+
+Post-boot warning `Value 140 exceeds the maximum bitwidth (32) for type
+'int32'` pointed at `(m << 140)` in `_e4m3_round`'s subnormal branch: a
+140-bit shift of an int32 is undefined behavior in triton (the CPU torch
+validation had passed only because C++ left the UB unmasked). Replaced with
+the trivially exact `m.to(tl.float32) * 2.0**-9` (m <= 8, power of two).

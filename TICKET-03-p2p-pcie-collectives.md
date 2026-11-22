@@ -194,3 +194,13 @@ single command) runs the production functions — sections A (has_multicast
 False), B (P2P band correctness vs NCCL reference + latency + 30-call
 bank-rotation stress), C (NCCL band + input None + GB/s), D (mixed-size
 state coexistence). PASS bar: all correctness checks + P2P AR < 50 µs.
+
+### Addendum (sauron bring-up, P2P bisection lever)
+
+The first serving run produced coherent-looking-but-gibberish tokens ("!"),
+so a bisection lever was added: `SGLANG_OPT_INKLING2_P2P_MAX_BYTES`
+(EnvInt in srt/environ.py, default 256*1024) now drives the P2P/NCCL
+dispatch threshold in inkling2_comm.py (was a module constant). Set it to 0
+to force every all-reduce through NCCL and isolate the new P2P-read path
+from the (pre-existing, upstream) NCCL path. The server log's collectives
+line already prints the effective cap.

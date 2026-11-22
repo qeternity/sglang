@@ -12,6 +12,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,8 @@ def _rank_sum(X, Y, N: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
 # P2P path below); larger ones go through NCCL. Sized from the sauron probe
 # (TICKET-03): one-shot P2P-read ARs at decode size cost ~8 us, while large
 # P2P transfers over the patched PCIe link degrade to ~1-2 GB/s.
-P2P_MAX_BYTES = 256 * 1024
+# SGLANG_OPT_INKLING2_P2P_MAX_BYTES=0 disables the P2P path (diagnostic).
+P2P_MAX_BYTES = envs.SGLANG_OPT_INKLING2_P2P_MAX_BYTES.get()
 
 
 @triton.jit

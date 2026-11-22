@@ -57,7 +57,7 @@ def _e4m3_round(x):
     n = q.to(tl.int32)
     f = q - n
     m = n + (f > 0.5).to(tl.int32) + ((f == 0.5).to(tl.int32) & (n & 1))
-    sub = (m << 140).to(tl.float32, bitcast=True)
+    sub = m.to(tl.float32) * 2.0**-9  # exact (m <= 8, power of two)
     # Normal grid 1.mmm * 2^e (e in -6..8): qn = a * 2^(3-e), exact, in [8, 16).
     bits = a.to(tl.int32, bitcast=True)
     e = ((bits >> 23) & 0xFF) - 127
