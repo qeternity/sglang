@@ -291,7 +291,7 @@ def main():
              + torch.rand(1_000_000, device=DEVICE) * (math.log(448.0) - math.log(2.0**-14))
          )),
         ("random-bit fp32 in [0,448)",
-         torch.randint(0, 2**32, (1_000_000,), device=DEVICE, dtype=torch.int32)
+         torch.randint(0, 2**32, (1_000_000,), device=DEVICE, dtype=torch.uint32)
          .view(torch.float32)
          .abs()
          .clamp(max=447.0)),
