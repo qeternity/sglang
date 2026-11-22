@@ -119,7 +119,7 @@ def worker(rank: int, world: int, init_file: str):
         check(
             rank,
             "multicast_all_reduce sum correct (bf16 decode)",
-            torch.allclose(out, 3.0),
+            torch.allclose(out, torch.full_like(out, 3.0)),
         )
     )
 
@@ -134,7 +134,7 @@ def worker(rank: int, world: int, init_file: str):
     x = torch.full((1, HIDDEN), float(rank + 1), dtype=torch.bfloat16, device="cuda")
     out = comm.all_reduce(x, group, multicast=True)
     results.append(
-        check(rank, "all_reduce (P2P branch) sum correct", torch.allclose(out, 3.0))
+        check(rank, "all_reduce (P2P branch) sum correct", torch.allclose(out, torch.full_like(out, 3.0)))
     )
     us = timed(lambda: comm.all_reduce(x, group, multicast=True), ITERS)
     if rank == 0:
@@ -145,8 +145,8 @@ def worker(rank: int, world: int, init_file: str):
     ok = True
     for i in range(30):
         out = p2p_oneshot(group, rank, float(rank + 1 + i))
-        # (rank + 1 + i) + ((1 - rank) + 1 + i) = 2i + 1
-        if not torch.allclose(out, 1.0 + 2.0 * i):
+        # (rank + 1 + i) + ((1 - rank) + 1 + i) = 3 + 2i
+        if not torch.allclose(out, torch.full_like(out, 3.0 + 2.0 * i)):
             ok = False
             break
     results.append(check(rank, "30 alternating P2P calls (bank rotation)", ok))
@@ -203,7 +203,7 @@ def worker(rank: int, world: int, init_file: str):
     outb = comm.multicast_all_reduce(b, group)
     results.append(
         check(
-            rank, "bf16 + fp32 states coexist, both correct", torch.allclose(outb, 3.0)
+            rank, "bf16 + fp32 states coexist, both correct", torch.allclose(a, torch.full_like(a, 3.0)) and torch.allclose(outb, torch.full_like(outb, 3.0))
         )
     )
     c = comm.multicast_all_reduce_input(group, (1, HIDDEN), torch.bfloat16)
@@ -212,7 +212,7 @@ def worker(rank: int, world: int, init_file: str):
         check(
             rank,
             "bf16 state still healthy after fp32 call",
-            torch.allclose(comm.multicast_all_reduce(c, group), 3.0),
+            torch.allclose(comm.multicast_all_reduce(c, group), torch.full_like(c, 3.0)),
         )
     )
 
