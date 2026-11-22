@@ -14,6 +14,7 @@ from triton.language.extra import libdevice
 from sglang.kernels.jit.utils import is_arch_support_pdl, load_jit
 from sglang.kernels.ops.moe.inkling2_experts_sm90 import (
     ROW_LOOP_MIN_ROWS,
+    _e4m3_round,
     _nvfp4_values,
     _ue8m0,
 )
@@ -586,7 +587,7 @@ def _swiglu_fake_quantize_mxfp8(
     y = _capped_swiglu(gate, up, tl.load(Gammas + row), GATE_CAP, UP_CAP)
     y = y.to(tl.bfloat16).to(tl.float32)
     values, exponent = _mxfp8_block(tl.reshape(y, (BLOCK // 32, 32)))
-    q = values.to(tl.float32) * _ue8m0(exponent)[:, None]
+    q = _e4m3_round(values) * _ue8m0(exponent)[:, None]
     tl.store(Y + row * N + cols, tl.reshape(q, (BLOCK,)).to(tl.bfloat16), mask)
 
 

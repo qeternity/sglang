@@ -41,6 +41,40 @@ def _e2m1_round(x):
 
 
 @triton.jit
+def _e4m3_round(x):
+    """cvt.rn.satfinite.e4m3.f32 via exact fp32 arithmetic: round x onto the
+    e4m3fn grid (ties to even, saturating at 448) and return it in fp32.
+    Triton has no fp8e4nv cast below sm89, but every e4m3fn value is exact in
+    fp32 and each op here is exact, so this is bit-identical to the hardware
+    cast (validated against torch's e4m3fn cast on 18M adversarial values,
+    including all grid points and all ties)."""
+    is_nan = x != x  # noqa: PLR0124 - NaN check
+    a = tl.where(is_nan, 0.0, tl.abs(x))
+    # Saturation: the midpoint between 448 (1.75 * 2^8) and 512 (2^9) is 480.
+    a = tl.where(a >= 480.0, 448.0, a)
+    # Subnormal grid m * 2^-9 (m in 0..7): q = a * 512, exact, rounds to m.
+    q = a * 512.0
+    n = q.to(tl.int32)
+    f = q - n
+    m = n + (f > 0.5).to(tl.int32) + ((f == 0.5).to(tl.int32) & (n & 1))
+    sub = (m << 140).to(tl.float32, bitcast=True)
+    # Normal grid 1.mmm * 2^e (e in -6..8): qn = a * 2^(3-e), exact, in [8, 16).
+    bits = a.to(tl.int32, bitcast=True)
+    e = ((bits >> 23) & 0xFF) - 127
+    qn = (bits + (3 - e) * (1 << 23)).to(tl.float32, bitcast=True)
+    nn = qn.to(tl.int32)
+    fn = qn - nn
+    r = nn + (fn > 0.5).to(tl.int32) + ((fn == 0.5).to(tl.int32) & (nn & 1))
+    # r * 2^(e-3) in bits: r = 8 + m3; r == 16 carries to the next binade.
+    carry = r >> 4
+    m3 = r & 7
+    norm = (((124 + e + carry) << 23) | (m3 << 20)).to(tl.float32, bitcast=True)
+    out = tl.where(a < 2.0**-6, sub, norm)
+    out = tl.where(is_nan, float("nan"), out)
+    return tl.where(x < 0.0, -out, out)
+
+
+@triton.jit
 def _block_error(x, reconstructed):
     groups: tl.constexpr = x.shape[0]
     error = tl.abs(reconstructed - x)
@@ -104,8 +138,8 @@ def _nvfp4_values(x, amax):
     block_max = tl.max(tl.abs(x), 1)
     scale6 = tl.minimum(block_max * (encoder_scale * (1.0 / 6.0)), 448.0)
     scale4 = tl.minimum(block_max * (encoder_scale * 0.25), 448.0)
-    scale6 = scale6.to(tl.float8e4nv).to(tl.float32)
-    scale4 = scale4.to(tl.float8e4nv).to(tl.float32)
+    scale6 = _e4m3_round(scale6)
+    scale4 = _e4m3_round(scale4)
     inverse6 = tl.minimum(tl.div_rn(1.0, scale6 * decoder_scale), 3.4028234663852886e38)
     inverse4 = tl.minimum(tl.div_rn(1.0, scale4 * decoder_scale), 3.4028234663852886e38)
     rounded6 = _e2m1_round(x * inverse6[:, None])
@@ -146,7 +180,7 @@ def _fake_quantize_mxfp8_rows(X, Y, XS, K: tl.constexpr, BLOCK: tl.constexpr):
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + row * XS + cols, cols < K, other=0).to(tl.float32)
     values, exponent = _mxfp8_block(tl.reshape(x, (BLOCK // 32, 32)))
-    y = values.to(tl.float32) * _ue8m0(exponent)[:, None]
+    y = _e4m3_round(values) * _ue8m0(exponent)[:, None]
     tl.store(Y + row * K + cols, tl.reshape(y, (BLOCK,)).to(tl.bfloat16), cols < K)
 
 

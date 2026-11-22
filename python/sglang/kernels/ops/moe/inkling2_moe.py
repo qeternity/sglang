@@ -44,7 +44,9 @@ def _mxfp8_block(groups):
     values = tl.minimum(
         tl.maximum(values, -448.0), 448.0, propagate_nan=tl.PropagateNan.ALL
     )
-    return values.to(tl.float8e4nv), exponent
+    # fp32 (e4m3 casts are sm89+ only in triton; the real-quantize consumer
+    # casts at its store, the fake-quantize consumers round via _e4m3_round).
+    return values, exponent
 
 
 @triton.jit
@@ -58,7 +60,7 @@ def _mxfp8_quantize(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr, USE_PDL: tl.c
     values, exponent = _mxfp8_block(tl.reshape(x, (BLOCK // 32, 32)))
     groups = tl.program_id(1) * (BLOCK // 32) + tl.arange(0, BLOCK // 32)
     tl.store(S + row * (N // 32) + groups, exponent, groups < N // 32)
-    tl.store(Y + row * N + cols, tl.reshape(values, (BLOCK,)), cols < N)
+    tl.store(Y + row * N + cols, tl.reshape(values.to(tl.float8e4nv), (BLOCK,)), cols < N)
 
 
 def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

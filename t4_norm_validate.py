@@ -260,6 +260,60 @@ def main():
             print(f"  [FAIL-EXPECTED] {label}: {type(e).__name__}: {str(e)[:200]}")
             traceback.print_exc(limit=3)
 
+    print("\n== E. triton _e4m3_round vs torch e4m3fn cast (fake-quant scales) ==")
+    import triton
+    import triton.language as tl
+    from sglang.kernels.ops.moe.inkling2_experts_sm90 import _e4m3_round
+
+    @triton.jit
+    def _e4m3_probe(X, Y, BLOCK: tl.constexpr):
+        cols = tl.arange(0, BLOCK)
+        tl.store(Y + cols, _e4m3_round(tl.load(X + cols)))
+
+    def e4m3_tensor(x):
+        y = torch.empty_like(x)
+        _e4m3_probe[(triton.cdiv(x.numel(), 1024),)](x, y, 1024)
+        return y
+
+    ref_e4m3 = lambda x: x.to(torch.float8_e4m3fn).to(torch.float32)
+
+    for label, x in (
+        ("log-uniform [2^-14, 448]",
+         torch.exp(torch.log(2.0**-14) + torch.rand(1_000_000, device=DEVICE)
+         * (torch.log(448.0) - torch.log(2.0**-14)))),
+        ("random-bit fp32 in [0,448)",
+         torch.randint(0, 2**32, (1_000_000,), device=DEVICE, dtype=torch.int32)
+         .view(torch.float32)
+         .abs()
+         .clamp(max=447.0)),
+        ("clamped mxfp8 values",
+         (torch.randn(1_000_000, device=DEVICE) * 448.0).clamp(-448.0, 448.0)),
+        ("all e4m3 grid points + ties",
+         None),
+    ):
+        if x is None:
+            bits = torch.arange(256, dtype=torch.int64)
+            e = (bits >> 3) & 0xF
+            mm = bits & 0x7
+            vals = torch.where(
+                e > 0,
+                (1.0 + mm.float() / 8.0) * torch.tensor(2.0 ** (e - 7)),
+                torch.tensor(mm * 2.0**-9),
+            ).float()
+            x = torch.cat([vals, (vals[:-1] + vals[1:]) / 2.0,
+                           torch.tensor([0.0, 448.0, 480.0, 512.0, 1e38])]).cuda()
+        got = e4m3_tensor(x)
+        want = ref_e4m3(x)
+        same = (got == want) | (torch.isnan(got) & torch.isnan(want))
+        bad = int((~same).sum())
+        all_ok &= bad == 0
+        print(f"  {label}: {'OK' if bad == 0 else 'MISMATCH'} (n={x.numel()}, bad={bad})")
+        if bad:
+            idx = (~same).nonzero().flatten()[:5]
+            for i in idx:
+                print(f"    x={x[i].item():.17g} got={got[i].item():.17g} "
+                      f"want={want[i].item():.17g}")
+
     print(
         f"\nVERDICT: {'T4 PASS' if all_ok else 'T4 FAIL'} (triton fallback vs reference)"
     )

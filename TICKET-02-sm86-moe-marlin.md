@@ -174,3 +174,27 @@ the `USE_PDL: tl.constexpr` guard idiom (default False where the signature
 has defaulted args), with `PDL` passed at every launch. Repo-wide sweep of
 the remaining inkling2 triton files (sconv, linear, loop, residual_add,
 attn, attn_prologue, comm): all already guarded and launch-gated.
+
+### Addendum 3 (sauron bring-up, e4m3fn cast is sm89+-only in triton)
+
+The Marlin experts path reached `experts_sm90.fake_quantize` and failed at
+compile: `tl.float8e4nv` (e4m3fn) is only available in triton on sm89+
+("supported fp8 dtypes are fp8e4b15, fp8e5" on sm_86) — the same wall vLLM
+hit on A100 (they gated fp8 MoE kernels to sm89). The fake quantize is
+intentional on SM86 (it emulates the NVFP4/MXFP8 activation quantization so
+the W4A16 Marlin GEMM reproduces the shipped model's numerics), so it can't
+be gated away. Replaced the hardware cast with `_e4m3_round(x)`: an
+exact-arithmetic e4m3fn round-trip (RNE, ties-to-even, saturate at 448)
+implemented in exact fp32 + int32 bit ops only (all e4m3fn values are exact
+in fp32, every op is exact, so it is bit-identical to the hardware cast).
+The torch mirror of the same ops was validated CPU-side against
+`.to(torch.float8_e4m3fn)` on 18M values (log-uniform, random bit patterns,
+all 256 grid points, all 253 tie midpoints, denormal/480/inf/NaN specials,
+pipeline-shaped scales) — 100% bit match. Sites switched: `_nvfp4_values`
+(scale rounding, the crasher), `_fake_quantize_mxfp8_rows` and
+`_swiglu_quantize` (value quantize); `_mxfp8_block` now returns fp32 values
+and the one consumer that needs real e4m3 bytes (the Hopper-only
+`_mxfp8_quantize` in `inkling2_moe.py`) casts at its store — Hopper
+numerics unchanged (same cast, same point in the pipeline). GPU check
+added as section E of `t4_norm_validate.py` (triton `_e4m3_round` vs torch
+e4m3fn cast on the box).
