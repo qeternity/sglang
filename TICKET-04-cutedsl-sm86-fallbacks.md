@@ -144,3 +144,16 @@ never loaded. Audited all other new triton kernels for the same bug class:
 clean. Probe section B also had an argument bug (output_scale length 2
 with m=1 → the kernel's assert fired; loop now uses length 1, plus an
 explicit rows_per_output_scale=2 case).
+
+## Addendum 3: attn_res triton kernel — CUDA-graph-safe source offsets
+
+Decode graph capture crashed in the triton attn_res launcher: it rebuilt the
+int64 source-offset tensor per call with torch.tensor(list, device=...), an
+unpinned H2D copy that is not capturable (and whose pinned-memory variant
+would race the pinned allocator on SM8x decode, since the copy is async and
+the next layer call would recycle the pinned block). The offsets encode the
+message-bank data_ptrs, which are static-buffer addresses — identical across
+eager steps, capture, and every graph replay. They are now cached in
+_OFFSETS_CACHE keyed by the pointer tuple (+ element size + device), built
+once on the first eager call (the warmup forward) and reused forever:
+no H2D traffic per call, nothing to capture, nothing to race.

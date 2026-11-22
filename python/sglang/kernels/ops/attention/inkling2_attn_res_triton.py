@@ -82,6 +82,32 @@ def _attn_res_fwd(
     tl.store(Out + q * T * D + t * D + cols, acc, mask=mask)
 
 
+_OFFSETS_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _source_offsets(blocks: list[torch.Tensor]) -> torch.Tensor:
+    """Element offsets of each source relative to blocks[0], cached by pointer
+    tuple. The blocks are the model's static message-bank views, so their
+    data_ptrs are stable across steps and across graph replays; a per-call
+    torch.tensor(..., device=...) H2D copy here would be both un-capturable
+    (unpinned) and a host-race with the pinned allocator on SM8x decode."""
+    base = blocks[0]
+    key = (
+        tuple(block.data_ptr() for block in blocks),
+        base.element_size(),
+        base.device,
+    )
+    cached = _OFFSETS_CACHE.get(key)
+    if cached is None:
+        base_ptr = base.data_ptr()
+        cached = torch.tensor(
+            [(block.data_ptr() - base_ptr) // base.element_size() for block in blocks],
+            dtype=torch.int64,
+            device=base.device,
+        )
+        _OFFSETS_CACHE[key] = cached
+    return cached
+
 def attn_res(
     blocks: list[torch.Tensor],
     partial_addend: torch.Tensor | None,
@@ -112,12 +138,7 @@ def attn_res(
     if not tokens:
         return tuple(output.unbind(0))
 
-    base_ptr, element_size = base.data_ptr(), base.element_size()
-    offsets = torch.tensor(
-        [(block.data_ptr() - base_ptr) // element_size for block in blocks],
-        dtype=torch.int64,
-        device=base.device,
-    )
+    offsets = _source_offsets(blocks)
     block = 1 << (width - 1).bit_length()
     _attn_res_fwd[(tokens, n_queries)](
         base,
