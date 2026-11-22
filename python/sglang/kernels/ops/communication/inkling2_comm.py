@@ -223,7 +223,7 @@ def all_reduce(x: torch.Tensor, group, *, multicast: bool = False) -> torch.Tens
         )
         return output
     if not has_multicast(group):
-        if x.nbytes <= P2P_MAX_BYTES:
+        if x.nbytes <= P2P_MAX_BYTES and not torch.cuda.is_current_stream_capturing():
             state = _p2p_state(group, x.numel(), x.dtype, x.device)
             region = state.input(x.numel())
             region.copy_(x.flatten())
@@ -249,6 +249,11 @@ def multicast_all_reduce_input(group, shape, dtype):
     if not has_multicast(group):
         if n * dtype.itemsize > P2P_MAX_BYTES:
             return None
+        if torch.cuda.is_current_stream_capturing():
+            # Decode graphs capture the stateless NCCL path (the oneshot's
+            # capture-time fallback does the same on NVLink boxes); the banked
+            # P2P state is eager-only. Callers handle None via NCCL.
+            return None
         return _p2p_state(group, n, dtype, _device()).input(n).view(shape)
     return _multicast_view(group, _device(), dtype, n).view(shape)
 
@@ -267,7 +272,7 @@ def multicast_all_reduce(x, group):
             x.view(-1), "sum", group.device_group.group_name
         )
         return x
-    if x.nbytes <= P2P_MAX_BYTES:
+    if x.nbytes <= P2P_MAX_BYTES and not torch.cuda.is_current_stream_capturing():
         state = _p2p_state(group, x.numel(), x.dtype, x.device)
         state.input(x.numel()).copy_(x.view(-1))
         return state.reduce(x.view(-1)).view_as(x)

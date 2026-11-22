@@ -63,3 +63,24 @@ wrong to test x in place on the P2P path; it now checks the return values
 (outa/outb). Both production call sites already used the return value, so
 nothing else changed. True in-place on the P2P path would require an extra
 synchronization round trip and is not worth ~1 us per call.
+
+### Addendum 6 (sauron bring-up, capture-time NCCL fallback — CUDA graphs at TP2)
+
+The official H200 recipe (TP4/EP4, no --disable-cuda-graph) proved the
+earlier claim "Inkling2 is graph-less by design on Hopper" wrong: on NVLink
+boxes the decode graph captures the STATELESS path — oneshot_all_reduce_input
+returns None during stream capture when its state isn't created yet (and the
+oneshot is TP4/8-only by `world_size in (4, 8)`), so the captured decode
+graph contains the fixed-buffer multimem/NCCL all-reduce (stateless,
+capture-safe), while the banked/rotating fast paths (oneshot, and my P2P)
+serve the eager path (prefill, uncaptured batch sizes).
+
+The P2P port now mirrors that exactly: all three P2P entry points
+(multicast_all_reduce_input -> None, multicast_all_reduce, all_reduce) skip
+the banked P2P path while torch.cuda.is_current_stream_capturing() and take
+the NCCL branch instead. The NCCL fallback is the same code the P2P_MAX_BYTES
+= 0 diagnostic exercised on sauron (server worked end-to-end with all ARs
+on NCCL), so the captured graph runs a proven path. P2P stays the eager fast
+path (50 us vs ~2x for NCCL at 4.6 KB). With --disable-cuda-graph dropped
+from the recipe, decode should capture and the launch-bound 15 tok/s should
+move toward the 60-130 tok/s the box's HBM + in-graph AR budget allows.
