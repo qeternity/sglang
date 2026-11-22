@@ -14,6 +14,7 @@ PASS bar:
     fine on SM86; the dispatch already routes around them).
 """
 
+import math
 import sys
 import traceback
 
@@ -285,8 +286,10 @@ def main():
 
     for label, x in (
         ("log-uniform [2^-14, 448]",
-         torch.exp(torch.log(2.0**-14) + torch.rand(1_000_000, device=DEVICE)
-         * (torch.log(448.0) - torch.log(2.0**-14)))),
+         torch.exp(
+             math.log(2.0**-14)
+             + torch.rand(1_000_000, device=DEVICE) * (math.log(448.0) - math.log(2.0**-14))
+         )),
         ("random-bit fp32 in [0,448)",
          torch.randint(0, 2**32, (1_000_000,), device=DEVICE, dtype=torch.int32)
          .view(torch.float32)
