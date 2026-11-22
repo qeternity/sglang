@@ -213,3 +213,22 @@ Diagnostic levers added (one pull covers both routes):
 - Boot with SGLANG_OPT_INKLING2_P2P_MAX_BYTES=0 to remove the P2P kernels
   from the warmup path entirely; clean run there points at the captured
   decode kernels, not the P2P path.
+
+## Addendum 3 (correction): the generic breakable default still captured prefill graphs
+
+Boot with the addendum-1 fix proved the first fix incomplete: skipping the
+Inkling FULL opt-in left the GENERIC hybrid default in place, which captured
+breakable prefill graphs anyway ("Fail when using backend: breakable for
+prefill runner"), and the first prefill replay died with
+CUDA_ERROR_ILLEGAL_ADDRESS from cuGraphLaunch — the breakable backend
+replays captured extend segments into the triton extend path, which has no
+replay-safe metadata contract (the FULL runner rejects EXTEND outright;
+breakable bypasses that guard and faults at replay instead).
+
+The hook now DECLARES prefill backend DISABLED for inkling on the
+triton/SM8x path (instead of merely skipping the FULL opt-in). Prefill runs
+the EagerRunner — the exact path all earlier boots served correctly on.
+Decode graphs are untouched: the triton backend does implement decode/verify
+replay, and decode capture completed cleanly on the same boot. An explicit
+--cuda-graph-backend-prefill still wins (early return above this branch),
+so a user forcing it on triton gets the replay fault back by choice.

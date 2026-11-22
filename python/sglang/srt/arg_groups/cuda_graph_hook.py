@@ -424,11 +424,15 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         *INKLING2_ARCHS,
     ):
         # The triton attention backend (the SM8x path) has no extend-mode
-        # CUDA-graph replay (triton_backend._apply_cuda_graph_metadata
-        # accepts decode/verify modes only), and every SM8x box runs triton
-        # (the T5 fail-fast guard enforces it). Opt into full-graph prefill
-        # capture only when the prefill backend supports it (FA4); on
-        # triton/SM8x let the generic cascade keep prefill graphs disabled.
+        # CUDA-graph replay: triton_backend._apply_cuda_graph_metadata accepts
+        # decode/verify modes only, and the breakable prefill backend replays
+        # captured extend segments into that unsupported contract — the replay
+        # faults with CUDA_ERROR_ILLEGAL_ADDRESS at cuGraphLaunch. Every SM8x
+        # box runs triton (the T5 fail-fast guard enforces it). So opt into
+        # full-graph prefill capture only when the prefill backend supports it
+        # (FA4), and otherwise FORCE prefill graphs off — skipping the opt-in
+        # alone is not enough, because the generic hybrid default still
+        # captures breakable prefill graphs.
         from sglang.srt.runtime_context import get_platform
 
         prefill_backend, _decode_backend = attention_backends_of(cfg)
@@ -437,6 +441,12 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
                 server_args,
                 "_apply_inkling_prefill_cuda_graph_default",
                 cuda_graph_backend_prefill=Backend.FULL,
+            )
+        else:
+            declare_resolution(
+                server_args,
+                "_apply_inkling_prefill_cuda_graph_default",
+                cuda_graph_backend_prefill=Backend.DISABLED,
             )
 
 
