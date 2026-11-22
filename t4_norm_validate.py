@@ -273,13 +273,14 @@ def main():
     from sglang.kernels.ops.moe.inkling2_experts_sm90 import _e4m3_round
 
     @triton.jit
-    def _e4m3_probe(X, Y, BLOCK: tl.constexpr):
-        cols = tl.arange(0, BLOCK)
-        tl.store(Y + cols, _e4m3_round(tl.load(X + cols)))
+    def _e4m3_probe(X, Y, N, BLOCK: tl.constexpr):
+        cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        x = tl.load(X + cols, mask=cols < N, other=0.0)
+        tl.store(Y + cols, _e4m3_round(x), mask=cols < N)
 
     def e4m3_tensor(x):
         y = torch.empty_like(x)
-        _e4m3_probe[(triton.cdiv(x.numel(), 1024),)](x, y, 1024)
+        _e4m3_probe[(triton.cdiv(x.numel(), 1024),)](x, y, x.numel(), 1024)
         return y
 
     ref_e4m3 = lambda x: x.to(torch.float8_e4m3fn).to(torch.float32)

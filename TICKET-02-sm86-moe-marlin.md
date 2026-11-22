@@ -222,3 +222,27 @@ denormals, random bit patterns, pipeline-shaped values) with 0 mismatches.
 Note this bug corrupts MoE activation fake-quant scales by a factor of 8
 in the 124 version — the server output was doubly wrong (norm bug + this)
 until the norm fix landed.
+
+### Addendum 6 (sauron bring-up, the t4 section E probe kernel was broken)
+
+A level-by-level triton debugger (t4_e4m3_debug.py) showed that a pure
+load->store ECHO (level 0, zero arithmetic) already diverged: exactly the
+first 1024 elements were computed, everything after was uninitialized.
+Root cause: the probe wrapper kernel in t4_norm_validate.py (and the
+debugger's kernels) used `tl.load(X + cols)` without the
+`tl.program_id(0) * BLOCK` offset, so every program in the grid read and
+wrote the same first-1024 region. Consequences for the record:
+
+- The /8-factor diagnosis and the 124->127 fix were REAL: they came from
+  the small 516-element grid-points case (fits in one block, fully
+  computed) plus the first-1024 elements of the big cases, where the
+  kernel did run.
+- The "542623 / 996751 / 483 bad" counts on the 1M-element cases after
+  the 127 fix were uninitialized-memory noise, NOT a second kernel bug.
+  The production `_e4m3_round` kernel itself (which is a pure elementwise
+  jit function called inside properly-indexed kernels) had never been
+  validated on the box.
+- Probe fixed (block offset + N mask); the section E verdict on the fixed
+  kernel is now the pending GPU question. A local torch mirror of the
+  fixed kernel's bit ops matches torch's e4m3fn cast on 6M adversarial
+  values with 0 mismatches.

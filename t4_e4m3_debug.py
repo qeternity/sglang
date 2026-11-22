@@ -20,9 +20,10 @@ BLOCK = 1024
 
 
 @triton.jit
-def _levels(X, Y, LEVEL: tl.constexpr, BLOCK: tl.constexpr):
-    cols = tl.arange(0, BLOCK)
-    x = tl.load(X + cols)
+def _levels(X, Y, N, LEVEL: tl.constexpr, BLOCK: tl.constexpr):
+    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < N
+    x = tl.load(X + cols, mask=mask, other=0.0)
     is_nan = x != x  # noqa: PLR0124 - NaN check
     a = tl.where(is_nan, 0.0, tl.abs(x))
     a = tl.where(a >= 480.0, 448.0, a)
@@ -80,13 +81,14 @@ def _levels(X, Y, LEVEL: tl.constexpr, BLOCK: tl.constexpr):
         v = sel
     else:
         v = out
-    tl.store(Y + cols, v)
-
+    tl.store(Y + cols, v, mask=mask)
 
 @triton.jit
-def _repo_kernel(X, Y, BLOCK: tl.constexpr):
-    cols = tl.arange(0, BLOCK)
-    tl.store(Y + cols, _e4m3_round(tl.load(X + cols)))
+def _repo_kernel(X, Y, N, BLOCK: tl.constexpr):
+    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < N
+    x = tl.load(X + cols, mask=mask, other=0.0)
+    tl.store(Y + cols, _e4m3_round(x), mask=mask)
 
 
 # int levels (stored as int32), rest are float32
@@ -155,9 +157,9 @@ def main():
         dtype = torch.int32 if level in INT_LEVELS else torch.float32
         out = torch.empty_like(xt, dtype=dtype)
         if level == 17:
-            _repo_kernel[(xs.numel() // BLOCK,)](xt, out, BLOCK)
+            _repo_kernel[(xs.numel() // BLOCK,)](xt, out, xs.numel(), BLOCK)
         else:
-            _levels[(xs.numel() // BLOCK,)](xt, out, level, BLOCK)
+            _levels[(xs.numel() // BLOCK,)](xt, out, xs.numel(), level, BLOCK)
         got = out.cpu()
         if level == 0:
             on_dev = int((out != xt).sum())
