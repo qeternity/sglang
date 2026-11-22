@@ -39,13 +39,20 @@ P2P_MAX_BYTES = envs.SGLANG_OPT_INKLING2_P2P_MAX_BYTES.get()
 
 @triton.jit
 def _p2p_rank_sum(
-    InPtrs, Out, N, CAP: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr
+    InPtrs, Out, N, BankOff, CAP: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr
 ):
-    """Sum rank r's slot (offset r*CAP) read from every rank's own buffer."""
+    """Sum rank r's slot (offset r*CAP) of bank BankOff (in elements) read from
+    every rank's own buffer. InPtrs is the array of per-rank buffer base
+    addresses; the bank offset is applied in elements inside the kernel because
+    a host-side shift of the pointer values would be in bytes, not elements."""
     indices = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     total = tl.full((BLOCK,), 0.0, tl.float32)
     for rank in tl.static_range(WORLD):
-        base = tl.load(InPtrs + rank).to(tl.pointer_type(Out.dtype.element_ty))
+        base = (
+            tl.load(InPtrs + rank)
+            .to(tl.pointer_type(Out.dtype.element_ty))
+            + BankOff
+        )
         total += tl.load(base + rank * CAP + indices, indices < N, other=0.0).to(
             tl.float32
         )
@@ -99,7 +106,8 @@ class _P2PAllReduce:
             **({"launch_pdl": True} if is_arch_support_pdl() else {}),
         )
         _p2p_rank_sum[(triton.cdiv(n, 256),)](
-            self.in_ptrs + self.bank * self.world * self.capacity,
+            self.in_ptrs,
+            self.bank * self.world * self.capacity,
             self.out,
             n,
             self.capacity,
