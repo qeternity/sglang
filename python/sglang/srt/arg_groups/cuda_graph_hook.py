@@ -423,11 +423,21 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         "InklingForConditionalGenerationMTP",
         *INKLING2_ARCHS,
     ):
-        declare_resolution(
-            server_args,
-            "_apply_inkling_prefill_cuda_graph_default",
-            cuda_graph_backend_prefill=Backend.FULL,
-        )
+        # The triton attention backend (the SM8x path) has no extend-mode
+        # CUDA-graph replay (triton_backend._apply_cuda_graph_metadata
+        # accepts decode/verify modes only), and every SM8x box runs triton
+        # (the T5 fail-fast guard enforces it). Opt into full-graph prefill
+        # capture only when the prefill backend supports it (FA4); on
+        # triton/SM8x let the generic cascade keep prefill graphs disabled.
+        from sglang.srt.runtime_context import get_platform
+
+        prefill_backend, _decode_backend = attention_backends_of(cfg)
+        if prefill_backend != "triton" and not get_platform().is_sm80:
+            declare_resolution(
+                server_args,
+                "_apply_inkling_prefill_cuda_graph_default",
+                cuda_graph_backend_prefill=Backend.FULL,
+            )
 
 
 def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):

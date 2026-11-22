@@ -171,3 +171,22 @@ for interactive serving the fix is to pin the state pool and let the rest
 go to KV: add `--max-mamba-cache-size 128` (4 slots x 32 target concurrency)
 to the recipe, which grows the window pool ~1.7x (~31k tokens, ~30 full
 windows). The T6 perf scenarios (concurrency 1 and 8) never bind the pool.
+
+## Addendum: prefill CUDA graphs are FA4-only — auto-disabled on triton/SM8x
+
+Sauron (triton backend, no --disable-cuda-graph) crashed at startup in
+`capture_prefill_graph`: `triton_backend._apply_cuda_graph_metadata` accepts
+decode/verify forward modes only and raises "Invalid forward mode:
+ForwardMode.EXTEND ... for CUDA Graph replay" for prefill shapes. H200 never
+hits this because FA4 implements extend-mode graph replay.
+
+Fix in `cuda_graph_hook.apply_inkling_prefill_cuda_graph_default`: Inkling
+used to unconditionally opt into full-graph prefill capture; it now only
+does so when the prefill attention backend is not triton and the platform
+is not SM8x (every SM8x box is forced to triton by the T5 fail-fast guard).
+On triton/SM8x the generic cascade keeps prefill graphs disabled (prefill
+runs through the EagerRunner), while DECODE graphs still capture — the
+triton backend supports decode graph replay, and the in-graph tensor-parallel
+ARs take the capture-time NCCL fallback added in the T3 addendum-6 commit
+(the banked P2P path is eager-only). An explicit --cuda-graph-backend-prefill
+/ --disable-prefill-cuda-graph still wins (unchanged).
