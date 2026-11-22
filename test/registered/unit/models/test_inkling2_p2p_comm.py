@@ -21,6 +21,14 @@ import torch
 from sglang.kernels.ops.communication import inkling2_comm as comm
 
 
+@pytest.fixture(autouse=True)
+def _no_capture(monkeypatch):
+    # CPU build: torch.cuda.is_current_stream_capturing raises; the production
+    # guard is CUDA-only. Fake it as False (not capturing).
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: False, raising=False
+    )
+
 def make_group(world=2):
     calls = []
 
