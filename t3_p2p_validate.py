@@ -197,13 +197,13 @@ def worker(rank: int, world: int, init_file: str):
     # Decode (bf16, cap 4096) and mid (fp32, cap 16384) states coexist.
     a = comm.multicast_all_reduce_input(group, (1, HIDDEN), torch.bfloat16)
     a.copy_(torch.full_like(a, float(rank + 1)))
-    comm.multicast_all_reduce(a, group)
+    outa = comm.multicast_all_reduce(a, group)
     b = comm.multicast_all_reduce_input(group, (8, HIDDEN), torch.float32)
     b.copy_(torch.full_like(b, float(rank + 1)))
     outb = comm.multicast_all_reduce(b, group)
     results.append(
         check(
-            rank, "bf16 + fp32 states coexist, both correct", torch.allclose(a, torch.full_like(a, 3.0)) and torch.allclose(outb, torch.full_like(outb, 3.0))
+            rank, "bf16 + fp32 states coexist, both correct", torch.allclose(outa, torch.full_like(outa, 3.0)) and torch.allclose(outb, torch.full_like(outb, 3.0))
         )
     )
     c = comm.multicast_all_reduce_input(group, (1, HIDDEN), torch.bfloat16)

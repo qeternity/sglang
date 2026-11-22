@@ -38,3 +38,28 @@ barrier guarantee no peer still reads slot k when call k+2 overwrites it.
 The probe needed no change — its `a`-after-call check was the correct
 contract all along; this run also makes the fp32-state sub-check
 independently meaningful.
+
+### Addendum 5 (sauron bring-up, the in-place write-back was wrong — reverted)
+
+Addendum 4's in-place write-back (sum copied back into the input bank slot)
+is UNSAFE and was reverted. The write-back executes on this rank's stream
+immediately after its own rank-sum, but the peer rank's rank-sum of the SAME
+call is still reading this rank's bank slot through the peer pointer; nothing
+orders the write-back after that in-flight peer read (the next call's
+barrier comes after the write-back). The pre-in-place design was safe
+precisely because the bank slot kept holding the input until call k+2, at
+which point the double buffer + barrier ordering proved no peer could still
+be reading it. Observed on sauron: with contended GPUs (a hung probe
+instance running in the background stretching calls ~50x) the first P2P sum
+came back wrong and section D failed; on idle GPUs the same window wedged
+the 30-call bank-rotation loop instead of just corrupting data.
+
+Resolution: the P2P path keeps the return-value contract — x is copied into
+the input bank first (which also fixes the latent fresh-tensor bug where a
+non-view x would never have been reduced), the sum is returned in the
+separate out view, and x is left untouched. The docstring now states the
+per-path contract instead of claiming in-place everywhere. The probe was
+wrong to test x in place on the P2P path; it now checks the return values
+(outa/outb). Both production call sites already used the return value, so
+nothing else changed. True in-place on the P2P path would require an extra
+synchronization round trip and is not worth ~1 us per call.

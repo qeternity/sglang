@@ -254,13 +254,12 @@ def multicast_all_reduce_input(group, shape, dtype):
 
 
 def multicast_all_reduce(x, group):
-    """All-reduce x in place across the group; the return value is x holding
-    the sum on every path. Uses the multimem kernel when the group's symmetric
-    memory has a multicast pointer; on P2P-only hardware (no multicast)
-    payloads at or below P2P_MAX_BYTES sum through direct peer reads (x is
-    copied into the state's input bank first, so the call works for a fresh
-    tensor as well as for the matching multicast_all_reduce_input view, and
-    the sum is written back into x) and larger ones go through NCCL."""
+    """All-reduce across the group; the return value always holds the sum.
+    On the multimem (NVLink) and NCCL paths the reduce happens in x itself;
+    on the P2P path (x is copied into the state's input bank first, so the
+    call works for a fresh tensor as well as for the matching
+    multicast_all_reduce_input view) the summed values are returned in a
+    separate view and x is left unchanged — use the return value."""
     if group.world_size == 1:
         return x
     if has_multicast(group):
@@ -271,8 +270,7 @@ def multicast_all_reduce(x, group):
     if x.nbytes <= P2P_MAX_BYTES:
         state = _p2p_state(group, x.numel(), x.dtype, x.device)
         state.input(x.numel()).copy_(x.view(-1))
-        x.view(-1).copy_(state.reduce(x.view(-1)))
-        return x
+        return state.reduce(x.view(-1)).view_as(x)
     x.view(-1).copy_(group.all_reduce(x.view(-1)))
     return x
 
