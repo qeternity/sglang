@@ -142,6 +142,15 @@ def main():
     xt = xs.cuda()
     ref = ref_chain(xs)
 
+    # ---- pre-checks (pure torch, no triton): which side is lying? ----
+    print(f"devices: {torch.cuda.device_count()}, using cuda:0")
+    fresh = xs.cuda()
+    print(f"H2D check torch.equal(xt, xs.cuda()) again: "
+          f"{torch.equal(xt, fresh)}")
+    print(f"zeros: host={int((xs == 0).sum())}  device={int((xt == 0).sum())}")
+    print(f"xt[1020:1034] = {xt[1020:1034].cpu().tolist()[:8]}")
+    print(f"xs[1020:1034] = {xs[1020:1034].tolist()[:8]}\n")
+
     for level in range(18):
         dtype = torch.int32 if level in INT_LEVELS else torch.float32
         out = torch.empty_like(xt, dtype=dtype)
@@ -150,6 +159,10 @@ def main():
         else:
             _levels[(xs.numel() // BLOCK,)](xt, out, level, BLOCK)
         got = out.cpu()
+        if level == 0:
+            on_dev = int((out != xt).sum())
+            print(f"  device-side check: kernel-out vs xt on GPU: "
+                  f"{on_dev} mismatches")
         want = ref[level]
         same = got == want
         if level not in INT_LEVELS:
