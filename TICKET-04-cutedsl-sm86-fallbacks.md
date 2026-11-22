@@ -126,3 +126,21 @@ normalize_values, which the loop models require). Dispatch in a new
 import). t4 probe gained section C2 (triton vs pure-torch reference across
 t/d/n/nq/addend/normalize, incl. D=2304); CPU dispatch tests added
 (13 total in the dispatch file).
+
+### Addendum 2 (sauron bring-up, rms_norm placeholder-tensor bug)
+
+Sauron's t4 probe section A isolated it: triton rms_norm matched the torch
+reference 100% ONLY in the weight+pre_weight case; every case without
+pre_weight was garbage (maxdiff up to 1e3, NaNs) — and the model calls
+RMSNorm without pre_weight, so this is what produced the all-"!" output.
+Root cause: `_rms_norm_rows` branched with `if Weight is not None` /
+`if PreWeight is not None`, but the caller passes the output tensor `y` as
+a placeholder when a weight is absent, so both branches were always taken
+and uninitialized memory from `y` was multiplied into x (before the
+reduction) and into y. Fixed with `HAS_WEIGHT` / `HAS_PRE_WEIGHT`
+tl.constexpr flags (the same pattern `_qk_l2_clip_rows` and
+`inkling2_attn_res_triton` already use); placeholders are now only passed,
+never loaded. Audited all other new triton kernels for the same bug class:
+clean. Probe section B also had an argument bug (output_scale length 2
+with m=1 → the kernel's assert fired; loop now uses length 1, plus an
+explicit rows_per_output_scale=2 case).

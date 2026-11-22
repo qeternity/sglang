@@ -137,7 +137,7 @@ def main():
                 (
                     "scale+out",
                     torch.rand(2, n, device=DEVICE, dtype=torch.bfloat16) * 1.5 + 0.5,
-                    torch.tensor([1.0, 2.0], device=DEVICE, dtype=torch.float32),
+                    torch.tensor([1.0], device=DEVICE, dtype=torch.float32),
                 ),
             ):
                 got = qk_l2_clip_fwd(
@@ -147,7 +147,13 @@ def main():
                     x, threshold, 1e-6, scale=scale, output_scale=out_scale
                 )
                 all_ok &= check(f"clip m={m} n={n} {label}", got, ref)
-    # 3D input (T, H, N) like the model feeds
+    # output_scale covering groups of rows (rows_per_output_scale > 1)
+    m8, n8 = 8, 128
+    x8 = torch.randn(m8, n8, device=DEVICE, dtype=torch.bfloat16) * 10
+    out8 = torch.tensor([1.0, 2.0], device=DEVICE, dtype=torch.float32)
+    got8 = qk_l2_clip_fwd(x8, threshold, 1e-6, output_scale=out8)
+    ref8 = ref_qk_l2_clip(x8, threshold, 1e-6, output_scale=out8)
+    all_ok &= check(f"clip m={m8} rows_per_out_scale=2", got8, ref8)
     t, h, n = 11, 4, 128
     x3 = torch.randn(t, h, n, device=DEVICE, dtype=torch.bfloat16) * 10
     scale3 = torch.rand(h, n, device=DEVICE, dtype=torch.bfloat16) * 1.5 + 0.5

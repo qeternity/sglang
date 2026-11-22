@@ -71,18 +71,20 @@ def _rms_norm_rows(
     N: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_PRE_WEIGHT: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
     mask = cols < N
     x = tl.load(X + row * N + cols, mask=mask, other=0.0).to(tl.float32)
-    if PreWeight is not None:
+    if HAS_PRE_WEIGHT:
         pw = tl.load(PreWeight + cols, mask=mask, other=0.0).to(tl.float32)
         x = x * pw
     sum_sq = tl.sum(x * x, axis=0)
     rstd = tl.rsqrt(sum_sq / N + eps)
     y = x * rstd
-    if Weight is not None:
+    if HAS_WEIGHT:
         w = tl.load(Weight + cols, mask=mask, other=0.0).to(tl.float32)
         y = y * w
     tl.store(Y + row * N + cols, y.to(Y.dtype.element_ty), mask=mask)
@@ -189,6 +191,8 @@ def rms_norm(
         n,
         float(eps),
         block,
+        weight is not None,
+        pre_weight is not None,
         num_warps=4 if block >= 1024 else 1,
     )
     return y.view(x.shape)
