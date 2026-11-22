@@ -107,9 +107,9 @@ class _P2PAllReduce:
         )
         _p2p_rank_sum[(triton.cdiv(n, 256),)](
             self.in_ptrs,
-            self.bank * self.world * self.capacity,
             self.out,
             n,
+            self.bank * self.world * self.capacity,
             self.capacity,
             self.world,
             256,
