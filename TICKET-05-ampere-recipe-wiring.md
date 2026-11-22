@@ -154,3 +154,20 @@ vision embeddings would silently corrupt the output (the prompt's
 placeholder tokens would be answered without their content), which is
 worse than an explicit error at encode time. The recipe therefore
 documents text-only scope; no image-dropping filter was added.
+
+### Addendum (sauron bring-up, pool rebalance for the 2x3090 recipe)
+
+First sustained serving on sauron shows the recipe's
+`--mamba-full-memory-ratio 0.8` over-provisions the mamba/loop-state pool
+(~95% idle at 24 running requests; ~1,900 slot capacity vs ~4 slots/request
+needed) while the sliding-window KV pool binds hard: the window pool holds
+only ~17.9k window-token slots (~17-18 concurrent full-1024 windows; it is
+byte-balanced with the full pool but ~10x costlier per token), so any queue
+deeper than ~17 requests triggers the scheduler's "KV cache pool is full.
+Retract requests." line (a generic message — the binding pool is the window
+one, at 96-99% usage, not the full pool at 12%). Retracting under a deep
+queue is correct scheduler behavior (T6 gsm8k-style backlogs hit it), but
+for interactive serving the fix is to pin the state pool and let the rest
+go to KV: add `--max-mamba-cache-size 128` (4 slots x 32 target concurrency)
+to the recipe, which grows the window pool ~1.7x (~31k tokens, ~30 full
+windows). The T6 perf scenarios (concurrency 1 and 8) never bind the pool.
