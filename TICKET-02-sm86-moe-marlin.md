@@ -159,3 +159,18 @@ probe already used by T3), routing small batches to the generic Marlin GEMM
 than the clustered GEMV; at 3090 MoE decode the GEMM path is the memory-bound one
 anyway. `moe_wna16_marlin.cuh` was audited: no PDL, no clusters, `#if SGL_CUDA_ARCH == 900`
 special-cases only — SM86-safe.
+
+### Addendum 2 (sauron bring-up, triton PDL gates in the MoE path)
+
+The MoE gate forward crashed in `_route_topk` (triton): `inkling2_route.py`,
+`inkling2_moe.py` (4 kernels: mxfp8_quantize, routed_rows,
+unweighted_post_reorder, routed_partial), and `inkling2_mxfp8.py`
+(_routed_swap_ab_matmul) all called `tl.extra.cuda.gdc_wait()/
+gdc_launch_dependents()` unconditionally — same sm_90-only instruction,
+fifth hiding place (the csrc sweep had covered `route.cuh` but not the
+triton kernels in the same file). All host launches already passed
+`launch_pdl=PDL` (module-level `is_arch_support_pdl()`); the kernels got
+the `USE_PDL: tl.constexpr` guard idiom (default False where the signature
+has defaulted args), with `PDL` passed at every launch. Repo-wide sweep of
+the remaining inkling2 triton files (sconv, linear, loop, residual_add,
+attn, attn_prologue, comm): all already guarded and launch-gated.

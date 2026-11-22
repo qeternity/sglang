@@ -32,9 +32,11 @@ def _route_topk(
     TOPK_POW2: tl.constexpr,
     BLOCK_N: tl.constexpr,
     RENORM: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
@@ -119,6 +121,7 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
             triton.next_power_of_2(topk),
             triton.next_power_of_2(n),
             fuse_renorm,
+            PDL,
             enable_fp_fusion=False,
             launch_pdl=PDL,
         )
@@ -149,9 +152,11 @@ def _route_metadata(
     BLOCK_M: tl.constexpr,
     SEARCH_N: tl.constexpr,
     SEARCH_E: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     ids = tl.load(Ids + offs, mask, other=65535)
@@ -269,6 +274,7 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
             block_size_m,
             block_n.bit_length(),
             block_e.bit_length(),
+            PDL,
             num_warps=min(32, max(4, block_n // 128)),
             launch_pdl=PDL,
         )

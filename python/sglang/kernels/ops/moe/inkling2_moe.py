@@ -48,9 +48,10 @@ def _mxfp8_block(groups):
 
 
 @triton.jit
-def _mxfp8_quantize(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+def _mxfp8_quantize(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr, USE_PDL: tl.constexpr):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + row * N + cols, cols < N, other=0).to(tl.float32)
@@ -79,7 +80,7 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         )
     elif x.numel():
         _mxfp8_quantize[(x.numel() // x.shape[-1], triton.cdiv(x.shape[-1], 256))](
-            x, values, scales, x.shape[-1], 256, enable_fp_fusion=False, launch_pdl=PDL
+            x, values, scales, x.shape[-1], 256, PDL, enable_fp_fusion=False, launch_pdl=PDL
         )
     return values, scales
 
@@ -167,9 +168,11 @@ def _routed_rows(
     TOP_K: tl.constexpr = 1,
     per_rank=1,
     THREADS: tl.constexpr = 128,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if STRIDED:
         chunks: tl.constexpr = (N + BLOCK - 1) // BLOCK
         lo = tl.load(Offsets)
@@ -305,6 +308,7 @@ def routed_rows(
             dst2src,
             exchange.top_k if push else 1,
             exchange.per_rank(x.shape[0] // exchange.top_k) if push else 1,
+            USE_PDL=PDL,
             enable_fp_fusion=False,
             launch_pdl=PDL,
         )
@@ -317,10 +321,11 @@ def _sm_count(device):
 
 @triton.jit
 def _unweighted_post_reorder(
-    X, Y, Src2Dst, TOP_K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr
+    X, Y, Src2Dst, TOP_K: tl.constexpr, H: tl.constexpr, BLOCK: tl.constexpr, USE_PDL: tl.constexpr
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     src = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < H
@@ -346,9 +351,11 @@ def _routed_partial(
     SCALED: tl.constexpr,
     BLOCK: tl.constexpr,
     SEARCH: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     src = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     lo = tl.load(Offsets)
@@ -390,6 +397,7 @@ def routed_partial(x, offsets, src2dst, top_k, *, nvfp4_scales=None):
             nvfp4_scales is not None,
             1024,
             experts.bit_length(),
+            PDL,
             launch_pdl=PDL,
         )
     return out
@@ -402,6 +410,6 @@ def unweighted_post_reorder(x, src2dst, top_k):
     )
     if out.numel():
         _unweighted_post_reorder[(out.shape[0], triton.cdiv(out.shape[1], 1024))](
-            x, out, src2dst, top_k, out.shape[1], 1024, launch_pdl=PDL
+            x, out, src2dst, top_k, out.shape[1], 1024, PDL, launch_pdl=PDL
         )
     return out

@@ -30,9 +30,11 @@ def _routed_swap_ab_matmul(
     BN: tl.constexpr,
     BK: tl.constexpr,
     TOP_K: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     entry = tl.load(Schedule + tl.program_id(0))
     if entry == -1:
         return
@@ -101,6 +103,7 @@ def _routed_matmul(
             128,
             block_k,
             top_k,
+            PDL,
             num_warps=4,
             num_stages=2 if block_k == 512 else 3,
             launch_pdl=PDL,
