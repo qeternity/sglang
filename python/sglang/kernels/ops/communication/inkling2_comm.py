@@ -49,9 +49,7 @@ def _p2p_rank_sum(
     total = tl.full((BLOCK,), 0.0, tl.float32)
     for rank in tl.static_range(WORLD):
         base = (
-            tl.load(InPtrs + rank)
-            .to(tl.pointer_type(Out.dtype.element_ty))
-            + BankOff
+            tl.load(InPtrs + rank).to(tl.pointer_type(Out.dtype.element_ty)) + BankOff
         )
         total += tl.load(base + rank * CAP + indices, indices < N, other=0.0).to(
             tl.float32
@@ -115,7 +113,6 @@ class _P2PAllReduce:
             256,
             enable_fp_fusion=False,
         )
-        self.bank = 1 - self.bank
         self.bank = 1 - self.bank
         if (
             envs.SGLANG_DEBUG_SYNC_INKLING2.get()

@@ -51,11 +51,11 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
     is_gfx115_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -79,7 +79,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx115 = _is_hip and is_gfx115_supported()
 # AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
@@ -882,6 +882,14 @@ def sm12x_fp32_lm_head(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def sm12x_bf16_lm_head_applies(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return _sm12x_bf16_gemv_eligible(x, weight)
+
+
+def sm12x_bf16_lm_head(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _sm12x_bf16_gemv(x, weight)
+
+
 def bf16_gemm_needs_autotune() -> bool:
     return _mm_bf16 is not None
 
@@ -1486,6 +1494,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
 
         self._maybe_apply_flashinfer_trtllm_bf16_block_layout(layer)
+        if self.use_flashinfer_trtllm_moe:
+            config = layer.moe_runner_config
+            swiglu_limit = config.swiglu_limit
+            if (
+                swiglu_limit is not None
+                and config.activation == "silu"
+                and config.is_gated
+                and not hasattr(layer, "_flashinfer_trtllm_gemm1_clamp_limit")
+            ):
+                clamp_limit = layer.w13_weight.new_full(
+                    (layer.num_local_experts,), swiglu_limit, dtype=torch.float32
+                )
+                # Keep the configured limit when resetting weights for validation.
+                clamp_limit._skip_weight_check = True
+                # Memory saver restores buffers in place for CUDA graph replay.
+                layer.register_buffer(
+                    "_flashinfer_trtllm_gemm1_clamp_limit",
+                    clamp_limit,
+                    persistent=False,
+                )
 
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
@@ -1722,6 +1750,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self._restore_trtllm_bf16_canonical_layout(layer, param, param_name)
 
     def _aiter_ck_moe_unsupported_reason(self, layer) -> Optional[str]:
+        # aiter's only gfx1250 MoE kernel takes MXFP4 weights with gate/up interleaved.
+        if is_gfx1250_supported():
+            return "aiter has no bf16 fused-MoE kernel on gfx1250"
+
         # aiter CK fused-MoE requires intermediate_size_per_partition to be 128-aligned
         # (GemmSpec=Default; otherwise CK raises "not support this GEMM problem").
         if layer.intermediate_size_per_partition % 128 != 0:
@@ -1882,6 +1914,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                gemm1_clamp_limit=getattr(
+                    layer, "_flashinfer_trtllm_gemm1_clamp_limit", None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

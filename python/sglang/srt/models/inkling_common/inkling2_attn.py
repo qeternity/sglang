@@ -10,10 +10,10 @@ from sglang.kernels.ops.attention.inkling2_attn import (
     gate_sink,
     pad_head_groups,
 )
+from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
-from sglang.kernels.ops.attention.inkling2_attn_prologue import attention_prologue
 from sglang.kernels.ops.communication.inkling2_comm import (
     all_reduce,
     oneshot_all_reduce,
@@ -120,9 +120,9 @@ class QKL2Clip(nn.Module):
                 qk_l2_clip_fwd_cutedsl,
             )
 
-        output = (
-            qk_l2_clip_fwd if self._use_triton else qk_l2_clip_fwd_cutedsl
-        )(x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale)
+        output = (qk_l2_clip_fwd if self._use_triton else qk_l2_clip_fwd_cutedsl)(
+            x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
+        )
         return output.view(x.shape)
 
 
@@ -496,6 +496,7 @@ class Inkling2Attention(nn.Module):
                 "Inkling2 mxfp8 KV cache requires the FA4 attention backend; run "
                 "the triton backend with --kv-cache-dtype bfloat16"
             )
+        fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
             if isinstance(hidden_states, torch.Tensor)
@@ -507,13 +508,14 @@ class Inkling2Attention(nn.Module):
         verify = mode.is_target_verify()
         compact = (
             not triton
-            and not mxfp8
+            and not fa4_mxfp8
             and self.fused_decode_prologue
             and (
                 mode.is_decode()
                 or verify
                 and (
                     get_platform().is_sm90
+                    or mxfp8
                     or envs.SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL.get()
                     and tokens <= VERIFY_REL_BIAS_MAX_TOKENS
                 )
@@ -569,7 +571,7 @@ class Inkling2Attention(nn.Module):
                 q, rel_bias = self._pad_heads(q), self._pad_heads(rel_bias)
         bias_kwargs = {"rel_bias_presheared": True} if presheared else {}
         output_dtype = q.dtype
-        if mxfp8:
+        if fa4_mxfp8:
             from sglang.kernels.ops.quantization.mxfp8_quant import to_mxfp8
 
             quantized_q = to_mxfp8(q.reshape(tokens, -1, self.head_dim))

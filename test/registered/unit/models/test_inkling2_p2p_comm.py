@@ -18,7 +18,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.kernels.ops.communication import inkling2_comm as comm
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +32,7 @@ def _no_capture(monkeypatch):
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: False, raising=False
     )
+
 
 def make_group(world=2):
     calls = []
@@ -159,3 +164,9 @@ def test_all_reduce_rejects_non_cuda_and_bad_dtype():
     x = torch.full((1, 2304), 1.5, dtype=torch.float64)
     with pytest.raises(ValueError, match="BF16 or FP32"):
         comm.all_reduce(x, group)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
